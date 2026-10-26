@@ -150,3 +150,46 @@ def grade(req: GradeRequest):
     except Exception as exc:
         # Keep the server response useful but do not expose stack traces or secrets.
         raise HTTPException(status_code=500, detail=f"Grading failed safely: {type(exc).__name__}") from exc
+
+
+@app.post("/chat/completions")
+def openai_compatible_chat(payload: dict[str, Any]):
+    """Small OpenAI-compatible adapter used by the existing Paperwise dashboard."""
+    messages = payload.get("messages")
+    if not isinstance(messages, list) or not messages:
+        raise HTTPException(status_code=400, detail="messages must be a non-empty array")
+    user_content = next((m.get("content") for m in reversed(messages)
+                         if isinstance(m, dict) and m.get("role") == "user"
+                         and isinstance(m.get("content"), str)), None)
+    if not user_content:
+        raise HTTPException(status_code=400, detail="A user message is required")
+    try:
+        data = json.loads(user_content)
+        # The dashboard sends {board, grade, questions:[{id, question, student_answer,
+        # maximum_marks, marking_points}]}; normalize to the validated API schema.
+        questions = []
+        for item in data.get("questions", []):
+            questions.append({
+                "id": item.get("id"),
+                "prompt": item.get("question", item.get("prompt", "")),
+                "answer": item.get("student_answer", item.get("answer", "")),
+                "marks": item.get("maximum_marks", item.get("marks")),
+                "criteria": item.get("marking_points", item.get("criteria", "")),
+            })
+        request = GradeRequest(board=data.get("board", "Unknown"),
+                               grade=data.get("grade", "Unknown"),
+                               questions=questions)
+    except Exception as exc:
+        raise HTTPException(status_code=400, detail="User message must contain a valid grading JSON payload") from exc
+    result = grade(request)
+    content_text = json.dumps({"results": [
+        {"id": item["id"], "score": item["score"], "rationale": item["rationale"]}
+        for item in result["results"]
+    ]})
+    return {
+        "id": "paperwise-local-completion",
+        "object": "chat.completion",
+        "model": payload.get("model", MODEL_ID),
+        "choices": [{"index": 0, "message": {"role": "assistant", "content": content_text},
+                     "finish_reason": "stop"}],
+    }
