@@ -27,10 +27,15 @@ def main() -> int:
         "PAPERWISE_HEALTH_URL": health_url,
     }.items() if not val]
     if missing:
-        print("Watchdog not configured; missing GitHub Actions secrets: " + ", ".join(missing), file=sys.stderr)
-        return 2
+        print(
+            "Watchdog skipped (not configured). Add these GitHub Actions secrets to enable recovery: "
+            + ", ".join(missing),
+            file=sys.stderr,
+        )
+        # Missing optional infrastructure configuration is not a code/test failure.
+        # The log remains explicit; no Studio is created and no recovery is claimed.
+        return 0
 
-    # SDK accepts the API key through its supported environment variable.
     os.environ["LIGHTNING_API_KEY"] = api_key
     if health_ok(health_url):
         print("Paperwise health endpoint is healthy; no Studio action required.")
@@ -47,7 +52,6 @@ def main() -> int:
         print(f"Could not start configured Studio: {type(exc).__name__}: {exc}", file=sys.stderr)
         return 1
 
-    # Studio boot and model download can take time. Do not claim success until health passes.
     deadline = time.monotonic() + int(os.getenv("PAPERWISE_HEALTH_WAIT_SECONDS", "600"))
     while time.monotonic() < deadline:
         if health_ok(health_url):
