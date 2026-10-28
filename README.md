@@ -4,15 +4,18 @@ Paperwise grades school answers against teacher-provided marking points. It is d
 
 ## Components
 - Existing Paperwise dashboard: https://paperwise-ai-exam-checker-p4b87k.v2.appdeploy.ai/
-- `server/`: self-hosted OpenAI-compatible grading API using an open-weight Hugging Face model.
-- `.lightning_studio/on_start.sh`: starts the API when a Lightning Studio launches.
-- `.github/workflows/lightning-watchdog.yml`: best-effort scheduled health check and Studio start via Lightning SDK.
+- `server/`: FastAPI grading API using an open-weight Hugging Face model.
+- `kaggle/paperwise_gpu_test.ipynb`: Kaggle GPU smoke-test notebook. It loads and evaluates the pretrained model; it is **not** a fine-tuning/training run and does not save trained weights.
+- `server/evaluate_live.py`: repeatable benchmark against a running API.
+- `.lightning_studio/on_start.sh`: starts the API when a configured Lightning Studio launches.
+- `.github/workflows/lightning-watchdog.yml`: best-effort health check and Studio start via Lightning SDK.
 
-## Important limitations
-1. No model host or Lightning credentials are supplied in this repository. The watchdog stays disabled until repository Actions secrets are configured.
-2. GitHub scheduled workflows are best-effort and can be delayed. This is not a 24/7 uptime guarantee.
-3. The model is an assistant, not a certified examiner. Always review marks; test against a representative, teacher-verified answer set before relying on scores.
-4. Do not commit API keys, access tokens, student names, or exam papers containing personal information.
+## Current deployment status and limitations
+1. The API source and Kaggle test notebook are in this repository, but a persistent public model API is **not verified/deployed** by the repository alone.
+2. The Lightning watchdog requires repository Actions secrets `LIGHTNING_API_KEY`, `LIGHTNING_TEAMSPACE`, `LIGHTNING_STUDIO`, and `PAPERWISE_HEALTH_URL`. Without these, it deliberately skips recovery. A green watchdog run with missing secrets does not mean an API is running.
+3. Kaggle notebook execution is temporary; ending a Kaggle session does not leave a permanent endpoint.
+4. The model is an assistant, not a certified examiner. Do not rely on marks without human review and a representative, teacher-verified benchmark.
+5. Do not commit API keys, access tokens, student names, or exam papers containing personal information.
 
 ## Local API quick start
 Python 3.11+ recommended:
@@ -22,7 +25,15 @@ pip install -r requirements.txt
 export PAPERWISE_MODEL_ID=Qwen/Qwen2.5-1.5B-Instruct
 uvicorn app:app --host 0.0.0.0 --port 8000
 ```
-First start downloads model weights. Memory and speed depend on the machine. `GET /health` reports readiness; `POST /api/grade` accepts a JSON grading request. See `docs/API.md`.
+First start downloads model weights. Memory and speed depend on the machine. `GET /health` reports process/model status; `POST /api/grade` accepts a JSON grading request. See `docs/API.md`.
+
+## Run the live grading regression benchmark
+With the API running:
+```bash
+cd server
+python evaluate_live.py --url http://127.0.0.1:8000
+```
+The report is saved to `paperwise-evaluation-report.json`. Its eight expected score ranges are a small regression smoke test, **not** a teacher-certified accuracy result. Review/replace the expected scores with teacher-approved values before using this as evidence of quality. A failed case returns exit code 2.
 
 ## Lightning setup (one-time)
 1. Open the Lightning Studio that should host Paperwise.
