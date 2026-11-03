@@ -1,0 +1,100 @@
+[
+  {
+    "name": "Grade typed answers with partial credit and bounded marks",
+    "sanity": true,
+    "viewport": "desktop",
+    "covers": [
+      "typed question and answer grading",
+      "managed AI backend integration",
+      "partial credit",
+      "maximum-mark validation",
+      "question-wise rationale"
+    ],
+    "description": "Submits a small set of typed answers to the live grading route and checks that each score is bounded by its question maximum.",
+    "steps": [
+      "Enter two complete questions with different maximum marks and plausible student answers",
+      "Run automatic marking",
+      "Inspect both question-wise results and the total"
+    ],
+    "expected": "One result is shown for each question, partial credit is possible, and no score exceeds its question maximum."
+  },
+  {
+    "name": "Reject invalid manual marks and oversized question sets",
+    "viewport": "mobile",
+    "covers": [
+      "manual question validation",
+      "positive maximum-mark validation",
+      "15-question request limit",
+      "no score on invalid input"
+    ],
+    "description": "Checks that invalid mark values and more than 15 manually entered questions are blocked before a grading request.",
+    "steps": [
+      "Enter a question with a zero or greater-than-100 maximum and try to mark it",
+      "Correct the marks, add 16 manual questions, and try again"
+    ],
+    "expected": "A clear validation message appears in each case and no score is generated."
+  },
+  {
+    "name": "Handle a managed AI service failure without partial scores",
+    "viewport": "desktop",
+    "covers": [
+      "AI service failure handling",
+      "all-or-nothing results",
+      "retryable user-visible error"
+    ],
+    "description": "Injects a grading API failure and verifies Paperwise does not display stale or partial scores.",
+    "qa_faults": [
+      {
+        "method": "POST",
+        "path": "/api/grade",
+        "status": 502,
+        "body_json": {
+          "error": "grading_failed",
+          "message": "Simulated grading failure. No scores were accepted."
+        }
+      }
+    ],
+    "steps": [
+      "Enter a complete typed question and answer",
+      "Run automatic marking while the API returns the injected failure"
+    ],
+    "expected": "A visible error appears, no result score is shown, and the user can retry."
+  },
+  {
+    "name": "Resolve section-level marks in an uploaded exam paper",
+    "viewport": "desktop",
+    "covers": [
+      "question-paper upload",
+      "answer-sheet upload",
+      "section-level mark distribution",
+      "inherited per-question maximum",
+      "out-of-order answer references",
+      "all-or-nothing scoring"
+    ],
+    "description": "Uploads a paper where a section heading is on the previous page, a question wraps across lines, and answers are out of order.",
+    "steps": [
+      "Upload a clear two-page paper with the final section heading at the bottom of page 1 and a marked question beginning on page 2",
+      "Upload answers that reference those questions in a different order",
+      "Run automatic marking and inspect the resolved question maxima"
+    ],
+    "expected": "The page-break section context and wrapped question are recovered, explicit per-question marks are retained, and answer references are matched without falsely rejecting the paper."
+  },
+  {
+    "name": "Read scanned pages on mobile and fail safely when text is unreadable",
+    "viewport": "mobile",
+    "covers": [
+      "photo OCR",
+      "scanned PDF OCR",
+      "English and Hindi OCR",
+      "mobile upload interaction",
+      "unreadable scan error handling"
+    ],
+    "description": "Checks the mobile upload workflow for scanned pages in supported languages and verifies unreadable pages do not produce invented marks.",
+    "steps": [
+      "Upload a clear scanned question-paper page and answer-sheet page",
+      "Wait for text extraction and run marking",
+      "Repeat with an unreadable or blank scan"
+    ],
+    "expected": "Readable text can proceed to marking; an unreadable page produces a clear error and no score."
+  }
+]

@@ -1,0 +1,18 @@
+{
+  "name": "Paperwise — AI Exam Checker",
+  "short_name": "Paperwise",
+  "description": "Check answers and review question-wise marks with Paperwise.",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#f6f7f4",
+  "theme_color": "#24664f",
+  "icons": [
+    {
+      "src": "/paperwise-icon.svg",
+      "type": "image/svg+xml",
+      "sizes": "any",
+      "purpose": "any"
+    }
+  ]
+}
