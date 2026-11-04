@@ -1,6 +1,4 @@
-import { useMemo, useState } from 'react';
-import { api } from '@appdeploy/client';
-import { extractTextFromFile } from './fileText';
+import { useMemo, useRef, useState } from 'react';
 import {
   Upload,
   FileText,
@@ -14,516 +12,267 @@ import {
   ArrowRight,
   ShieldCheck,
   SlidersHorizontal,
+  Loader2,
 } from 'lucide-react';
+import { extractDocument } from './fileText';
+import { MAX_QUESTIONS_PER_RUN, MarksUnresolvedError, evaluatePaper } from './exam/grade';
+import { paperFromManual, parsePaper, withMarksOverrides } from './exam/paper';
+import type { EvaluationReport, Paper, QuestionGrade } from './exam/model';
+import { createPuterChat } from './ai/provider';
+import { friendlyAiMessage } from './ai/errors';
 
-type Question = {
+type ManualQuestion = {
   id: number;
   prompt: string;
   answer: string;
   marks: number;
   criteria: string;
 };
-type Attachment = { id: number; name: string; type: string; size: number; extracting?: boolean; extractedText?: string; extractionError?: boolean };
-type Result = {
-  id: number;
-  ref?: string;
-  score: number;
-  max: number;
-  matched: string[];
-  missing: string[];
-  note: string;
+
+type Attachment = {
+  id: string;
+  name: string;
+  type: string;
+  size: number;
+  extracting: boolean;
+  extractedText: string;
+  warnings: string[];
+  error: string | null;
+  pageCount: number;
 };
 
-const initialQuestions: Question[] = [
-  { id: 1, prompt: '', answer: '', marks: 3, criteria: '' },
-];
+const initialQuestions: ManualQuestion[] = [{ id: 1, prompt: '', answer: '', marks: 3, criteria: '' }];
+
+const STATUS_LABEL: Record<QuestionGrade['status'], string> = {
+  graded: 'Marked',
+  unattempted: 'Not attempted',
+  unresolved: 'Needs review',
+};
+
+function formatMarks(value: number): string {
+  return Number.isInteger(value) ? String(value) : value.toFixed(1);
+}
+
+function paperSummaryLabel(paper: Paper): string {
+  const count = paper.questions.length;
+  return `${count} question${count === 1 ? '' : 's'} detected`;
+}
 
 function App() {
   const [board, setBoard] = useState('Any board');
   const [grade, setGrade] = useState('Any class');
-  const mode = 'automatic' as const;
-  const [questions, setQuestions] = useState<Question[]>(initialQuestions);
-  const [questionAttachments, setQuestionAttachments] = useState<Attachment[]>([]);
-  const [attachments, setAttachments] = useState<Attachment[]>([]);
-  const [results, setResults] = useState<Result[] | null>(null);
-  const [resultMethod, setResultMethod] = useState<'scheme' | 'ai' | null>(null);
-  const [modelStatus, setModelStatus] = useState('');
+  const [manual, setManual] = useState<ManualQuestion[]>(initialQuestions);
+  const [questionFiles, setQuestionFiles] = useState<Attachment[]>([]);
+  const [answerFiles, setAnswerFiles] = useState<Attachment[]>([]);
+  const [overrides, setOverrides] = useState<Record<string, number>>({});
+  const [report, setReport] = useState<EvaluationReport | null>(null);
+  const [status, setStatus] = useState('');
   const [error, setError] = useState('');
-  const [questionPaperText, setQuestionPaperText] = useState('');
-  const [answerSheetText, setAnswerSheetText] = useState('');
+  const [busy, setBusy] = useState(false);
+  const abortRef = useRef<AbortController | null>(null);
 
-  const totalMarks = useMemo(
-    () =>
-      questions.reduce((sum, q) => sum + Math.max(0, Number(q.marks) || 0), 0),
-    [questions]
+  const questionPaperText = useMemo(
+    () => questionFiles.map(file => file.extractedText).filter(Boolean).join('\n\n'),
+    [questionFiles]
   );
-  const awarded = results?.reduce((sum, r) => sum + r.score, 0) ?? 0;
-  const maxAwarded = results?.reduce((sum, r) => sum + r.max, 0) ?? 0;
+  const answerSheetText = useMemo(
+    () => answerFiles.map(file => file.extractedText).filter(Boolean).join('\n\n'),
+    [answerFiles]
+  );
 
-  function updateQuestion(
-    id: number,
-    key: keyof Question,
-    value: string | number
-  ) {
-    setQuestions(prev =>
-      prev.map(q => (q.id === id ? { ...q, [key]: value } : q))
-    );
-    setResults(null);
+  const parsedPaper = useMemo(() => parsePaper(questionPaperText), [questionPaperText]);
+  const filledManual = useMemo(
+    () => manual.filter(question => question.prompt.trim() && question.answer.trim()),
+    [manual]
+  );
+  const manualPaper = useMemo(
+    () =>
+      paperFromManual(
+        filledManual.map((question, index) => ({
+          key: String(index + 1),
+          prompt: question.prompt,
+          marks: Number(question.marks),
+          criteria: question.criteria,
+        })),
+        board
+      ),
+    [filledManual, board]
+  );
+  const basePaper = questionPaperText.trim() ? parsedPaper : manualPaper;
+  const paper = useMemo(() => withMarksOverrides(basePaper, overrides), [basePaper, overrides]);
+
+  const extracting = questionFiles.some(file => file.extracting) || answerFiles.some(file => file.extracting);
+  const unresolved = paper.questions.filter(question => question.max === null);
+  const attachmentIssues = [...questionFiles, ...answerFiles].flatMap(file => file.warnings);
+  const totalMarks = paper.questions.reduce((sum, question) => sum + (question.max ?? 0), 0);
+
+  function setManualQuestion(id: number, patch: Partial<ManualQuestion>) {
+    setManual(previous => previous.map(question => (question.id === id ? { ...question, ...patch } : question)));
+    setReport(null);
   }
 
-  function addQuestion() {
-    setQuestions(prev => [
-      ...prev,
-      { id: Date.now(), prompt: '', answer: '', marks: 2, criteria: '' },
-    ]);
-    setResults(null);
+  function addManualQuestion() {
+    setManual(previous => [...previous, { id: Date.now(), prompt: '', answer: '', marks: 2, criteria: '' }]);
+    setReport(null);
   }
 
-  function handleFiles(fileList: FileList | null, kind: 'question' | 'answer') {
-    if (!fileList) return;
-    const incoming = Array.from(fileList).filter(
-      file =>
-        file.type.startsWith('image/') ||
-        file.type === 'application/pdf' ||
-        file.type.startsWith('text/') ||
-        /\.(txt|md|csv|pdf)$/i.test(file.name)
-    );
-    if (incoming.length !== fileList.length) {
-      setError('Some files were skipped. Please use images, PDFs, or text files.');
-    }
-    const mapped = incoming.map(file => ({
-      file,
-      id: Date.now() + Math.random(),
+  async function addFiles(fileList: FileList | null, kind: 'question' | 'answer') {
+    if (!fileList?.length) return;
+    const files = Array.from(fileList);
+    setError('');
+    setReport(null);
+    if (kind === 'question') setOverrides({});
+
+    const created: Attachment[] = files.map((file, index) => ({
+      id: `${Date.now()}-${index}-${Math.random().toString(36).slice(2, 7)}`,
       name: file.name,
-      type: file.type,
+      type: file.type || 'unknown',
       size: file.size,
       extracting: true,
+      extractedText: '',
+      warnings: [],
+      error: null,
+      pageCount: 0,
     }));
-    const initial = mapped.map(({ file: _file, ...attachment }) => attachment);
-    if (kind === 'question') {
-      setQuestionAttachments(prev => [...prev, ...initial]);
-    } else {
-      setAttachments(prev => [...prev, ...initial]);
-    }
-    const updateAttachment = (id: number, patch: Partial<Attachment>) => {
-      const update = (items: Attachment[]) => items.map(item => item.id === id ? { ...item, ...patch } : item);
-      if (kind === 'question') setQuestionAttachments(prev => update(prev));
-      else setAttachments(prev => update(prev));
-    };
-    void (async () => {
-      for (const item of mapped) {
-        try {
-          setModelStatus('Reading text from ' + item.name + '…');
-          const text = await extractTextFromFile(item.file, setModelStatus);
-          if (!text.trim()) throw new Error('No readable text was found in ' + item.name + '.');
-          updateAttachment(item.id, { extracting: false, extractedText: text, extractionError: false });
-          if (kind === 'question') {
-            setQuestionPaperText(prev => prev ? prev + '\n\n' + text : text);
-          } else {
-            setAnswerSheetText(prev => prev ? prev + '\n\n' + text : text);
-          }
-          setResults(null);
-        } catch (error) {
-          updateAttachment(item.id, { extracting: false, extractionError: true });
-          setError(error instanceof Error ? error.message : 'Text extraction failed for ' + item.name + '.');
-        }
+    const update = kind === 'question' ? setQuestionFiles : setAnswerFiles;
+    update(previous => [...previous, ...created]);
+
+    for (let index = 0; index < files.length; index++) {
+      const file = files[index];
+      const attachment = created[index];
+      try {
+        const document = await extractDocument(file, setStatus);
+        update(previous =>
+          previous.map(item =>
+            item.id === attachment.id
+              ? {
+                  ...item,
+                  extracting: false,
+                  extractedText: document.text,
+                  warnings: document.warnings,
+                  pageCount: document.pages.length,
+                }
+              : item
+          )
+        );
+        setReport(null);
+      } catch (issue) {
+        const message = issue instanceof Error ? issue.message : `Could not read ${file.name}.`;
+        update(previous =>
+          previous.map(item => (item.id === attachment.id ? { ...item, extracting: false, error: message } : item))
+        );
+        setError(message);
       }
-      setModelStatus('');
-    })();
+    }
+    setStatus('');
+  }
+
+  function removeAttachment(kind: 'question' | 'answer', id: string) {
+    if (kind === 'question') {
+      setQuestionFiles(previous => previous.filter(file => file.id !== id));
+      setOverrides({});
+    } else {
+      setAnswerFiles(previous => previous.filter(file => file.id !== id));
+    }
+    setReport(null);
+  }
+
+  function resetAll() {
+    setManual(initialQuestions);
+    setQuestionFiles([]);
+    setAnswerFiles([]);
+    setOverrides({});
+    setReport(null);
+    setError('');
+    setStatus('');
   }
 
   async function evaluate() {
+    if (busy || extracting) return;
     setError('');
-    const hasQuestionPaper = !!questionPaperText.trim();
-    const hasAnswerSheet = !!answerSheetText.trim();
-    if (hasQuestionPaper !== hasAnswerSheet) {
-      setError('Upload both the question paper and the answer sheet, or enter questions and answers manually.');
-      return;
-    }
-    if (!hasQuestionPaper && questions.length > 15) {
-      setError('Automatic marking supports up to 15 manually entered questions per evaluation.');
-      return;
-    }
-    if (!hasQuestionPaper && questions.some(q => !q.prompt.trim() || !q.answer.trim())) {
-      setError('Add both a question and your answer before evaluation.');
-      return;
-    }
-    if (!hasQuestionPaper && questions.some(q => !Number.isFinite(Number(q.marks)) || Number(q.marks) <= 0 || Number(q.marks) > 100)) {
-      setError('Enter a maximum mark greater than 0 and no higher than 100 for every question.');
-      return;
-    }
-    if (mode === 'automatic') {
-      setResults(null);
-      setResultMethod(null);
-      setModelStatus('Preparing automatic marking…');
-      try {
-        if (!hasQuestionPaper) {
-          setModelStatus('Sending answers for AI marking…');
-          const response = await api.post('/api/grade', {
-            board,
-            grade,
-            questions: questions.map(q => ({
-              id: q.id,
-              prompt: q.prompt,
-              answer: q.answer,
-              marks: Number(q.marks),
-              criteria: q.criteria,
-            })),
-          });
-          const payload = response?.data;
-          if (!Array.isArray(payload?.results) || payload.results.length !== questions.length) {
-            throw new Error('The grading service returned incomplete results. No scores were accepted.');
-          }
-          const seen = new Set<number>();
-          const typedResults: Result[] = payload.results.map((item: any) => {
-            const question = questions.find(q => q.id === Number(item?.id));
-            const score = Number(item?.score);
-            if (!question || seen.has(question.id) || !Number.isFinite(score) || score < 0 || score > Number(question.marks) || typeof item?.rationale !== 'string' || item.rationale.trim().length < 4) {
-              throw new Error('The grading service returned an invalid or duplicate result. No scores were accepted.');
-            }
-            seen.add(question.id);
-            return { id: question.id, score, max: Number(question.marks), matched: [], missing: [], note: item.rationale.trim() };
-          });
-          if (seen.size !== questions.length) throw new Error('The grading service omitted one or more answers. No scores were accepted.');
-          setResults(typedResults);
-          setResultMethod('ai');
-          setModelStatus('');
-          return;
-        }
-        const puter = (window as any).puter;
-        if (!puter?.ai?.chat) throw new Error('Puter.js did not load. Check your connection and reload Paperwise.');
-        setModelStatus('Checking your uploaded answers…');
-        // Build a compact examiner guide once; never resend the full paper and
-        // answer sheet with every grading request.
-        const splitBounded = (value: string, limit: number) => {
-          const pieces: string[] = [];
-          let current = '';
-          const units = value
-            .replace(/\r/g, '')
-            .split(/\n+/)
-            .map(part => part.trim())
-            .filter(Boolean);
-          for (const unit of units) {
-            let remaining = unit;
-            while (remaining.length > limit) {
-              let cut = remaining.lastIndexOf(' ', limit);
-              if (cut < Math.floor(limit * 0.6)) cut = limit;
-              const segment = remaining.slice(0, cut).trim();
-              if (segment) {
-                const candidate = current ? current + '\n' + segment : segment;
-                if (candidate.length > limit && current) {
-                  pieces.push(current);
-                  current = segment;
-                } else {
-                  current = candidate;
-                }
-              }
-              remaining = remaining.slice(cut).trim();
-            }
-            if (remaining) {
-              const candidate = current ? current + '\n' + remaining : remaining;
-              if (candidate.length > limit && current) {
-                pieces.push(current);
-                current = remaining;
-              } else {
-                current = candidate;
-              }
-            }
-          }
-          if (current) pieces.push(current);
-          return pieces;
-        };
-        let paperGuide = '';
-        const answerChunks: string[] = [];
-        const attemptedAnswerRefs = new Set<string>();
-        if (hasQuestionPaper) {
-          // Start with small windows and automatically subdivide any excerpt
-          // whose response is truncated or malformed. Never fail solely because
-          // one chunk was too large for the provider's output budget.
-          // Overlap adjacent excerpts so section-level mark and attempt rules
-          // remain visible alongside questions near chunk boundaries.
-          const paperChunks: string[] = [];
-          // Larger overlapping windows reduce the chance that a question,
-          // its wrapped continuation, or a section rule is separated at a
-          // provider-request boundary. Prefer line/question boundaries.
-          const normalizedPaper = questionPaperText
-            .replace(/\r/g, '')
-            .replace(/[ \t]+\n/g, '\n')
-            .replace(/\n{3,}/g, '\n\n')
-            .trim();
-          const paperWindow = 1200;
-          const paperOverlap = 360;
-          for (let start = 0; start < normalizedPaper.length;) {
-            let end = Math.min(normalizedPaper.length, start + paperWindow);
-            if (end < normalizedPaper.length) {
-              const candidates = [
-                normalizedPaper.lastIndexOf('\n', end),
-                normalizedPaper.lastIndexOf('. ', end),
-                normalizedPaper.lastIndexOf('] ', end),
-                normalizedPaper.lastIndexOf(') ', end),
-                normalizedPaper.lastIndexOf(' ', end),
-              ];
-              const boundary = candidates.find(point => point > start + Math.floor(paperWindow * 0.55));
-              if (boundary !== undefined) end = boundary + 1;
-            }
-            const excerpt = normalizedPaper.slice(start, end).trim();
-            if (excerpt) paperChunks.push(excerpt);
-            if (end >= normalizedPaper.length) break;
-            start = Math.max(start + 1, end - paperOverlap);
-          }
-          const guideParts: string[] = [];
-          let processedParts = 0;
-          const extractPaperPart = async (partText: string, depth = 0): Promise<void> => {
-            const extractPrompt = 'Read this exam-paper excerpt and return ONLY compact JSON: {"rules":["short rule"],"questions":[{"ref":"Q1(a)","section":"A","max":2}]}. List every visible question/subquestion reference. Resolve each question maximum using all explicit instructions visible in this excerpt, including section headings, per-question marks, mark distributions such as 1x5=5, and instructions that every question in a section carries the same marks. If a section gives a total and a clear question count/distribution, calculate the per-question maximum only when unambiguous. Do not assign a section total to each question. Do not infer from common exam patterns. If the marks cannot be resolved from the excerpt, use max:null and explain the ambiguity in rules. Preserve section and attempt/choice instructions. No markdown.\nBOARD/CLASS: ' + board + ' / ' + grade + '\nEXCERPT:\n' + partText;
-            const extractController = new AbortController();
-            const extractTimeout = window.setTimeout(() => extractController.abort(), 120000);
-            let extractResponse: any;
-            try {
-              extractResponse = await puter.ai.chat(extractPrompt, {
-                model: 'deepseek/deepseek-v4.1-flash',
-                temperature: 0,
-                max_tokens: 700,
-                normalize: true,
-                fallback: true,
-                signal: extractController.signal,
-              });
-            } finally {
-              window.clearTimeout(extractTimeout);
-            }
-            const extractReason = String(extractResponse?.finish_reason ?? extractResponse?.choices?.[0]?.finish_reason ?? '').toLowerCase();
-            const extractContent = extractResponse?.message?.content;
-            const extractRaw = typeof extractContent === 'string' ? extractContent : Array.isArray(extractContent) ? extractContent.map((part: any) => typeof part?.text === 'string' ? part.text : '').join('\n') : typeof extractResponse?.text === 'string' ? extractResponse.text : typeof extractResponse === 'string' ? extractResponse : '';
-            const extractStart = extractRaw.indexOf('{');
-            const extractEnd = extractRaw.lastIndexOf('}');
-            let extracted: any = null;
-            if (extractReason !== 'length' && extractReason !== 'max_tokens' && extractStart >= 0 && extractEnd > extractStart) {
-              try { extracted = JSON.parse(extractRaw.slice(extractStart, extractEnd + 1)); } catch { extracted = null; }
-            }
-            if (!extracted || !Array.isArray(extracted.questions) || !Array.isArray(extracted.rules)) {
-              // A window edge can contain only the tail of a wrapped line or
-              // the continuation of a question captured in its overlapping
-              // neighbour. Ignore such fragments only when they contain no
-              // question label; a fragment containing a question must still
-              // be recovered or the paper is rejected safely.
-              const hasQuestionLabel = /\bQ(?:uestion)?\s*\d{1,2}\s*[.)]/i.test(partText);
-              if (depth >= 7 || partText.length < 60) {
-                if (!hasQuestionLabel) return;
-                throw new Error('Paperwise could not reliably read a question in the uploaded paper. Check the page containing that question or upload a clearer scan. No scores were generated.');
-              }
-              const midpoint = Math.floor(partText.length / 2);
-              const boundaries = [
-                partText.lastIndexOf('\n', midpoint),
-                partText.lastIndexOf('. ', midpoint),
-                partText.lastIndexOf(' ', midpoint),
-              ];
-              const boundary = boundaries.find(point => point > partText.length * 0.3 && point < partText.length * 0.7) ?? midpoint;
-              await extractPaperPart(partText.slice(0, boundary).trim(), depth + 1);
-              await extractPaperPart(partText.slice(boundary).trim(), depth + 1);
-              return;
-            }
-            guideParts.push(JSON.stringify({ rules: extracted.rules, questions: extracted.questions }));
-            processedParts++;
-            setModelStatus('Reading question paper (' + processedParts + ' parts checked)…');
-          };
-          for (const paperChunk of paperChunks) {
-            await extractPaperPart(paperChunk);
-          }
-          const catalogue = new Map<string, { ref: string; section: string; max: number }>();
-          const allRules = new Set<string>();
-          for (const part of guideParts) {
-            const parsedPart = JSON.parse(part);
-            for (const rule of parsedPart.rules) {
-              if (typeof rule === 'string' && rule.trim()) allRules.add(rule.trim());
-            }
-            for (const item of parsedPart.questions) {
-              const ref = typeof item?.ref === 'string' ? item.ref.trim() : '';
-              const maximum = Number(item?.max);
-              if (!ref || !Number.isFinite(maximum) || maximum <= 0 || maximum > 100) {
-                throw new Error('Paperwise could not confidently resolve the marks for ' + (ref || 'a detected question') + ' from the printed question or section instructions. Check that section’s marks and upload a clearer page. No scores were generated.');
-              }
-              const key = ref.toUpperCase().replace(/\s+/g, '');
-              const existing = catalogue.get(key);
-              if (existing && existing.max !== maximum) {
-                throw new Error('The paper shows conflicting maximum marks for ' + ref + '. Check the question paper. No scores were generated.');
-              }
-              catalogue.set(key, {
-                ref,
-                section: typeof item.section === 'string' ? item.section : '',
-                max: maximum,
-              });
-            }
-          }
-          if (!catalogue.size) throw new Error('No questions with clearly printed maximum marks could be identified. No scores were generated.');
-          paperGuide = JSON.stringify({
-            rules: Array.from(allRules),
-            questions: Array.from(catalogue.values()),
-          });
-          answerChunks.push(...splitBounded(answerSheetText, 2600));
-          if (!answerChunks.length) throw new Error('No readable answers were found in the uploaded answer sheet. No scores were generated.');
-          // Independently inventory attempted answer references before grading.
-          // This prevents a model response from silently omitting an answer.
-          for (const answerChunk of answerChunks) {
-            const inventoryPrompt = 'Identify every question/subquestion reference that has a student answer in this answer-sheet excerpt. Return ONLY JSON: {"attempted":["Q1(a)"]}. Do not list blank questions, instructions, or references merely mentioned in prose. Preserve the printed reference exactly. If no attempted answers are visible, return an empty array.\nEXCERPT:\n' + answerChunk;
-            const inventoryResponse: any = await puter.ai.chat(inventoryPrompt, {
-              model: 'deepseek/deepseek-v4.1-flash', temperature: 0, max_tokens: 500,
-              normalize: true, fallback: true,
-            });
-            const inventoryContent = inventoryResponse?.message?.content;
-            const inventoryRaw = typeof inventoryContent === 'string' ? inventoryContent : Array.isArray(inventoryContent) ? inventoryContent.map((part: any) => typeof part?.text === 'string' ? part.text : '').join('\n') : typeof inventoryResponse?.text === 'string' ? inventoryResponse.text : typeof inventoryResponse === 'string' ? inventoryResponse : '';
-            const inventoryStart = inventoryRaw.indexOf('{');
-            const inventoryEnd = inventoryRaw.lastIndexOf('}');
-            let inventory: any = null;
-            if (inventoryStart >= 0 && inventoryEnd > inventoryStart) {
-              try { inventory = JSON.parse(inventoryRaw.slice(inventoryStart, inventoryEnd + 1)); } catch { inventory = null; }
-            }
-            if (!inventory || !Array.isArray(inventory.attempted) || inventory.attempted.some((ref: any) => typeof ref !== 'string' || !ref.trim())) {
-              throw new Error('Paperwise could not verify which answers were attempted in one part of the answer sheet. No scores were generated.');
-            }
-            for (const ref of inventory.attempted) attemptedAnswerRefs.add(ref.toUpperCase().replace(/\s+/g, ''));
-          }
-          if (!attemptedAnswerRefs.size) throw new Error('No attempted answers could be identified in the answer sheet. No scores were generated.');
-        } else {
-          for (let i = 0; i < questions.length; i += 3) {
-            answerChunks.push(JSON.stringify(questions.slice(i, i + 3).map(q => ({ id: q.id, question: q.prompt, student_answer: q.answer, maximum_marks: Number(q.marks) }))));
-          }
-        }
+    setReport(null);
 
-        const allResults: Result[] = [];
-        const acceptedRefs = new Set<string>();
-        const catalogueByRef = new Map<string, number>();
-        if (hasQuestionPaper) {
-          const parsedGuide = JSON.parse(paperGuide);
-          for (const item of parsedGuide.questions) {
-            catalogueByRef.set(String(item.ref).toUpperCase().replace(/\s+/g, ''), Number(item.max));
-          }
-        }
-        for (let batchIndex = 0; batchIndex < answerChunks.length; batchIndex++) {
-          setModelStatus('Marking section ' + (batchIndex + 1) + ' of ' + answerChunks.length + '…');
-          const batchPrompt = hasQuestionPaper
-            ? 'Act as a careful school examiner. Use the compact question catalogue and printed attempt rules below. Grade ONLY answers in this excerpt; match question references even when out of order. Respect section attempt limits as far as the provided catalogue states. Accept equivalent wording and award fair partial marks for correct concepts, formulas and working. Never exceed the printed maximum. Return JSON only: {"results":[{"ref":"Q1(a)","score":1,"max":2,"rationale":"brief reason"}]}. Include only attempted answers visible in this excerpt. Keep rationale under 12 words.\nBOARD/CLASS: ' + board + ' / ' + grade + '\nQUESTION CATALOGUE AND RULES:\n' + paperGuide + '\nANSWER EXCERPT:\n' + answerChunks[batchIndex]
-            : 'You are a cautious school examiner. Grade ONLY these answers. Accept equivalent wording and award partial credit for correct relevant ideas/steps. Never exceed maximum_marks. Return compact JSON only: {"results":[{"id":1,"score":0,"max":1,"rationale":"brief reason"}]}. Include exactly one result for each supplied question; preserve its id and maximum marks. Keep each rationale under 12 words. Input: ' + answerChunks[batchIndex];
-          const controller = new AbortController();
-          const requestTimeout = window.setTimeout(() => controller.abort(), 180000);
-          let response: any;
-          try {
-            response = await puter.ai.chat(batchPrompt, {
-              model: 'deepseek/deepseek-v4.1-flash',
-              temperature: 0.1,
-              max_tokens: 1200,
-              normalize: true,
-              fallback: true,
-              signal: controller.signal,
-            });
-          } finally {
-            window.clearTimeout(requestTimeout);
-          }
-          const finishReason = response?.finish_reason ?? response?.choices?.[0]?.finish_reason;
-          if (finishReason === 'length' || finishReason === 'max_tokens') {
-            throw new Error('A marking section exceeded the AI output limit. No scores were applied; please retry with clearer section breaks.');
-          }
-          if (finishReason === 'content_filter') throw new Error('The AI service declined this grading request. No scores were applied.');
-          const responseContent = response?.message?.content;
-          const raw = typeof responseContent === 'string' ? responseContent : Array.isArray(responseContent) ? responseContent.map((part: any) => typeof part?.text === 'string' ? part.text : '').join('\n') : typeof response?.text === 'string' ? response.text : typeof response === 'string' ? response : '';
-          const cleaned = raw.trim();
-          const start = cleaned.indexOf('{');
-          const end = cleaned.lastIndexOf('}');
-          if (!raw.trim() || start < 0 || end <= start) throw new Error('The AI returned incomplete section data. No scores were applied.');
-          let data: any;
-          try { data = JSON.parse(cleaned.slice(start, end + 1)); } catch { throw new Error('The AI returned invalid section data. No scores were applied.'); }
-          if (!Array.isArray(data.results) || data.results.length === 0) throw new Error('A marking section returned no results. No scores were applied.');
-          const batchResults = data.results.map((r: any, index: number) => {
-            const q = hasQuestionPaper ? undefined : questions.find(item => item.id === Number(r.id));
-            const ref = hasQuestionPaper && typeof r.ref === 'string' ? r.ref.trim() : '';
-            const refKey = ref.toUpperCase().replace(/\s+/g, '');
-            const catalogueMaximum = hasQuestionPaper ? catalogueByRef.get(refKey) : undefined;
-            const maximum = hasQuestionPaper ? Number(r.max) : Number(q?.marks);
-            if ((!hasQuestionPaper && !q) ||
-                (hasQuestionPaper && (!ref || catalogueMaximum === undefined || acceptedRefs.has(refKey) || maximum !== catalogueMaximum)) ||
-                typeof r.score !== 'number' || !Number.isFinite(r.score) ||
-                !Number.isFinite(maximum) || maximum <= 0 || maximum > 100 ||
-                r.score < 0 || r.score > maximum ||
-                (q && maximum !== Number(q.marks)) ||
-                typeof r.rationale !== 'string' || r.rationale.trim().length < 4) {
-              throw new Error('The marking service returned a missing, duplicate, unknown, or invalid question result. No scores were applied.');
-            }
-            if (hasQuestionPaper) acceptedRefs.add(refKey);
-            return {
-              id: allResults.length + index + 1,
-              ref: hasQuestionPaper ? ref : undefined,
-              score: Math.round(r.score * 100) / 100,
-              max: maximum,
-              matched: [],
-              missing: [],
-              note: r.rationale.trim(),
-            };
-          });
-          if (!hasQuestionPaper && batchResults.length !== Math.min(3, questions.length - batchIndex * 3)) throw new Error('The AI omitted one or more manually entered questions. No scores were applied.');
-          allResults.push(...batchResults);
-        }
-                if (!allResults.length) throw new Error('The AI returned no gradeable answers. No scores were generated.');
-        if (hasQuestionPaper) {
-          const missingAttempted = Array.from(attemptedAnswerRefs).filter(ref => !acceptedRefs.has(ref));
-          if (missingAttempted.length) {
-            throw new Error('The AI did not return marks for every detected attempted answer (' + missingAttempted.slice(0, 5).join(', ') + '). No scores were applied; please retry with a clearer answer sheet.');
-          }
-        }
-        setResults(allResults);
-        setResultMethod('ai');
-        setModelStatus('');
-      } catch (e) {
-        const issue = e as { message?: string; code?: string; status?: number; statusCode?: number; upstreamCode?: string; upstreamStatus?: number; provider?: string; name?: string };
-        const message = typeof issue?.message === 'string' ? issue.message : e instanceof Error ? e.message : 'The model request failed.';
-        const rawDiagnostic = (() => { try { return JSON.stringify(e); } catch { return ''; } })();
-        const code = typeof issue?.code === 'string' ? issue.code : '';
-        const status = Number(issue?.status ?? issue?.statusCode ?? issue?.upstreamStatus ?? 0);
-        const providerCode = typeof issue?.upstreamCode === 'string' ? issue.upstreamCode : '';
-        const providerName = typeof issue?.provider === 'string' ? issue.provider : '';
-        const diagnostic = [providerName, providerCode, status ? 'HTTP ' + status : '', code].filter(Boolean).join(' · ');
-        setModelStatus('');
-        if (code === 'network_error' || /network|fetch failed|failed to fetch|connection/i.test(message)) {
-          setError('The connection to the AI service failed. Check your connection and retry. No score was generated.');
-        } else if (status === 429 || /rate.?limit|quota exceeded/i.test(message)) {
-          setError('The AI service is temporarily rate-limited. Wait a little and retry. No score was generated.');
-        } else if (message.includes('model_not_configured') || status === 503 || message.includes('503')) {
-          setError('Automatic marking is temporarily unavailable. No score was generated. Please try again shortly.');
-        } else if (message.startsWith('LOCAL_MODEL: ')) {
-          setError(message.replace('LOCAL_MODEL: ', ''));
-        } else {
-          const detailSource = message === 'The model request failed.' && rawDiagnostic ? rawDiagnostic : message;
-          const safeDetail = detailSource.replace(/https?:\/\/\S+/g, '[service link]').replace(/[\r\n]+/g, ' ').slice(0, 220);
-          setError('AI marking failed' + (diagnostic ? ' (' + diagnostic + ')' : '') + (safeDetail ? ': ' + safeDetail : '.') + ' No score was generated.');
-        }
-      }
+    const usingUpload = questionPaperText.trim().length > 0;
+    if (usingUpload && !answerSheetText.trim()) {
+      setError('Add the answer sheet that belongs with this question paper.');
       return;
     }
-    const next = questions.map(q => {
-      const criteria = q.criteria
-        .split(/[\n,;•]+/)
-        .map(x => x.trim())
-        .filter(Boolean);
-      const answer = q.answer.toLowerCase();
-      const matched = criteria.filter(point =>
-        answer.includes(point.toLowerCase())
+    if (!usingUpload) {
+      if (!filledManual.length) {
+        setError('Upload your question paper and answer sheet, or type at least one question and answer.');
+        return;
+      }
+      const incomplete = manual.some(question => (question.prompt.trim() || question.answer.trim()) && !(question.prompt.trim() && question.answer.trim()));
+      if (incomplete) {
+        setError('Add both the question and the answer for every row you started.');
+        return;
+      }
+      if (
+        manual.some(
+          question =>
+            question.prompt.trim() &&
+            (!Number.isFinite(Number(question.marks)) || Number(question.marks) <= 0 || Number(question.marks) > 100)
+        )
+      ) {
+        setError('Each question needs a maximum mark greater than 0 and no higher than 100.');
+        return;
+      }
+    }
+    if (!paper.questions.length) {
+      setError(
+        usingUpload
+          ? 'No numbered questions were detected in the question paper. Check the scan or type the questions manually.'
+          : 'Add at least one question to mark.'
       );
-      const score = criteria.length
-        ? Math.round((matched.length / criteria.length) * Number(q.marks) * 2) /
-          2
-        : 0;
-      const missing = criteria.filter(point => !matched.includes(point));
-      return {
-        id: q.id,
-        score: Math.min(Number(q.marks), score),
-        max: Number(q.marks),
-        matched,
-        missing,
-        note: criteria.length
-          ? 'Keyword-only draft estimate. This does not understand meaning, synonyms, calculations, or official board marking rules.'
-          : 'Add marking points to calculate a rubric preview. No marks were awarded automatically.',
-      };
-    });
-    setResults(next);
-    setResultMethod('scheme');
+      return;
+    }
+    if (paper.questions.length > MAX_QUESTIONS_PER_RUN) {
+      setError(`This paper has ${paper.questions.length} questions. Paperwise marks up to ${MAX_QUESTIONS_PER_RUN} at a time; split it into parts.`);
+      return;
+    }
+
+    const manualAnswers = filledManual.map((question, index) => `${index + 1}. ${question.answer}`).join('\n\n');
+    const controller = new AbortController();
+    abortRef.current = controller;
+    setBusy(true);
+    setStatus('Starting automatic marking…');
+    try {
+      const result = await evaluatePaper({
+        paper,
+        paperText: usingUpload ? questionPaperText : undefined,
+        answerText: usingUpload ? answerSheetText : manualAnswers,
+        board,
+        grade,
+        chat: createPuterChat(),
+        onProgress: setStatus,
+        signal: controller.signal,
+      });
+      setReport(result);
+      setOverrides(previous => {
+        const next = { ...previous };
+        for (const question of result.paper.questions) {
+          if (question.max !== null) next[question.key] = question.max;
+        }
+        return next;
+      });
+    } catch (issue) {
+      if (issue instanceof MarksUnresolvedError) {
+        setError(
+          `Confirm the maximum marks for ${issue.questions.map(question => question.ref).join(', ')}. Paperwise will not guess printed marks.`
+        );
+      } else {
+        const message = issue instanceof Error ? issue.message : '';
+        const alreadyClear = /^(Paperwise|No questions|This paper)/.test(message);
+        setError(alreadyClear ? message : friendlyAiMessage(issue));
+      }
+    } finally {
+      abortRef.current = null;
+      setBusy(false);
+      setStatus('');
+    }
   }
+
+  const percentage = report && report.paperTotal > 0 ? Math.round((report.awarded / report.paperTotal) * 100) : 0;
 
   return (
     <div className="app-shell">
@@ -541,18 +290,7 @@ function App() {
         <button className="side-item active">
           <SlidersHorizontal size={17} /> New evaluation
         </button>
-        <button
-          className="side-item"
-          onClick={() => {
-            setQuestions(initialQuestions);
-            setResults(null);
-            setQuestionAttachments([]);
-            setAttachments([]);
-            setQuestionPaperText('');
-            setAnswerSheetText('');
-            setError('');
-          }}
-        >
+        <button className="side-item" onClick={resetAll}>
           <FileText size={17} /> Start fresh
         </button>
         <div className="sidebar-bottom">
@@ -560,19 +298,22 @@ function App() {
           <span>
             Private by design
             <br />
-            <small>Files stay in this draft UI.</small>
+            <small>Pages are read on your device. Only extracted text is sent for marking.</small>
           </span>
         </div>
       </aside>
+
       <main className="main">
         <header className="topbar">
           <div className="crumb">
             Workspace <span>/</span> <b>New evaluation</b>
           </div>
           <div className="top-pill">
-            <span className="status-dot" /> Ready to check
+            <span className="status-dot" />
+            {busy ? 'Marking…' : report ? 'Marked' : 'Ready to check'}
           </div>
         </header>
+
         <section className="hero">
           <div className="hero-copy">
             <div className="eyebrow">
@@ -583,7 +324,10 @@ function App() {
               <br />
               <em>Understand every mark.</em>
             </h1>
-                          <p>Upload your question paper and answer sheet to get question-wise feedback and a clearer picture of what to revise.</p>
+            <p>
+              Upload your question paper and answer sheet to get question-wise feedback and a clearer picture of what to
+              revise.
+            </p>
           </div>
           <div className="hero-art">
             <div className="art-sheet">
@@ -611,7 +355,7 @@ function App() {
                 <span className="step">01</span>
                 <div>
                   <h2>Set up your paper</h2>
-                  <p>Choose your exam context if useful, then add your answers.</p>
+                  <p>Choose your exam context if useful. It helps the examiner use the right expectations.</p>
                 </div>
               </div>
               <span className="optional">ABOUT THE EXAM</span>
@@ -620,10 +364,7 @@ function App() {
               <div className="field-grid">
                 <label>
                   Board or curriculum
-                  <select
-                    value={board}
-                    onChange={e => setBoard(e.target.value)}
-                  >
+                  <select value={board} onChange={event => setBoard(event.target.value)}>
                     <option>Any board</option>
                     <option>CBSE</option>
                     <option>ICSE</option>
@@ -636,13 +377,10 @@ function App() {
                 </label>
                 <label>
                   Class or level
-                  <select
-                    value={grade}
-                    onChange={e => setGrade(e.target.value)}
-                  >
+                  <select value={grade} onChange={event => setGrade(event.target.value)}>
                     <option>Any class</option>
-                    {Array.from({ length: 12 }, (_, i) => (
-                      <option key={i}>Class {i + 1}</option>
+                    {Array.from({ length: 12 }, (_, index) => (
+                      <option key={index}>Class {index + 1}</option>
                     ))}
                     <option>University</option>
                     <option>Competitive exam</option>
@@ -656,7 +394,7 @@ function App() {
                 <span className="step">02</span>
                 <div>
                   <h2>Upload your question paper</h2>
-                  <p>Add the exam paper so the questions and printed marks are available for reference.</p>
+                  <p>Paperwise reads the questions, their printed marks, sections and internal choices.</p>
                 </div>
               </div>
               <span className="optional">INPUT</span>
@@ -667,7 +405,10 @@ function App() {
                 type="file"
                 multiple
                 accept="image/*,.pdf,.txt,.md"
-                onChange={e => handleFiles(e.target.files, 'question')}
+                onChange={event => {
+                  void addFiles(event.target.files, 'question');
+                  event.target.value = '';
+                }}
               />
               <label htmlFor="question-paper-files" className="upload-content">
                 <div className="upload-icon">
@@ -678,32 +419,33 @@ function App() {
                 <small>JPG · PNG · PDF · TXT</small>
               </label>
             </div>
-            {questionAttachments.length > 0 && (
+
+            {questionFiles.length > 0 && (
               <div className="attachment-list">
-                {questionAttachments.map(file => (
+                {questionFiles.map(file => (
                   <div className="attachment" key={file.id}>
                     <div className="file-icon">
-                      {file.type.startsWith('image/') ? (
-                        <Image size={17} />
-                      ) : (
-                        <FileText size={17} />
-                      )}
+                      {file.type.startsWith('image/') ? <Image size={17} /> : <FileText size={17} />}
                     </div>
                     <div className="file-info">
                       <strong>{file.name}</strong>
                       <span>
-                        {file.type || 'File'} · {(file.size / 1024).toFixed(0)}{' '}
-                        KB
+                        {file.type || 'File'} · {(file.size / 1024).toFixed(0)} KB
+                        {file.pageCount > 1 ? ` · ${file.pageCount} pages` : ''}
                       </span>
-                      <span className={file.extractedText && !file.extracting && !file.extractionError ? 'extraction-status' : ''}>{file.extracting ? 'Reading text…' : file.extractionError ? 'Text extraction failed' : file.extractedText ? 'Text extracted' : ''}</span>
+                      <span className={file.extractedText && !file.extracting && !file.error ? 'extraction-status' : ''}>
+                        {file.extracting
+                          ? 'Reading text…'
+                          : file.error
+                            ? 'Could not read this file'
+                            : file.extractedText
+                              ? 'Text extracted'
+                              : ''}
+                      </span>
                     </div>
                     <button
                       aria-label={'Remove question paper ' + file.name}
-                      onClick={() =>
-                        setQuestionAttachments(prev =>
-                          prev.filter(x => x.id !== file.id)
-                        )
-                      }
+                      onClick={() => removeAttachment('question', file.id)}
                     >
                       <X size={16} />
                     </button>
@@ -712,12 +454,64 @@ function App() {
               </div>
             )}
 
+            {attachmentIssues.length > 0 && (
+              <div className="warn-list">
+                {attachmentIssues.map((warning, index) => (
+                  <p key={index}>
+                    <AlertCircle size={14} /> {warning}
+                  </p>
+                ))}
+              </div>
+            )}
+
+            {questionPaperText.trim() && (
+              <div className="paper-summary">
+                <div className="paper-summary-head">
+                  <strong>{paperSummaryLabel(parsedPaper)}</strong>
+                  <span>{parsedPaper.resolvedTotal} marks found</span>
+                </div>
+                <div className="ref-chips">
+                  {parsedPaper.questions.slice(0, 32).map(question => (
+                    <span key={question.key} className={question.max === null ? 'ref-chip missing-mark' : 'ref-chip'}>
+                      {question.ref}
+                      {question.max !== null ? ` · ${formatMarks(question.max)}` : ' · ?'}
+                    </span>
+                  ))}
+                  {parsedPaper.questions.length > 32 && (
+                    <span className="ref-chip">+{parsedPaper.questions.length - 32} more</span>
+                  )}
+                </div>
+                {parsedPaper.sections.length > 0 && (
+                  <p className="hint">
+                    {parsedPaper.sections
+                      .map(section => `${section.name}${section.marksPerQuestion ? ` · ${section.marksPerQuestion} per question` : ''}`)
+                      .join(' · ')}
+                  </p>
+                )}
+                {!parsedPaper.questions.length && (
+                  <p className="hint">
+                    No numbered questions were detected. Check the extracted pages, or type your questions manually below.
+                  </p>
+                )}
+                {parsedPaper.warnings.length > 0 && (
+                  <details className="report-notes">
+                    <summary>Paper reading notes ({parsedPaper.warnings.length})</summary>
+                    <ul>
+                      {parsedPaper.warnings.map((warning, index) => (
+                        <li key={index}>{warning}</li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </div>
+            )}
+
             <div className="section-heading">
               <div>
                 <span className="step">03</span>
                 <div>
                   <h2>Upload your answer sheet</h2>
-                  <p>Add photos or a PDF of the answers you wrote.</p>
+                  <p>Answers can be in any order, continued across pages, or written as photos of your script.</p>
                 </div>
               </div>
               <span className="optional">YOUR WORK</span>
@@ -728,117 +522,172 @@ function App() {
                 type="file"
                 multiple
                 accept="image/*,.pdf,.txt,.md"
-                onChange={e => handleFiles(e.target.files, 'answer')}
+                onChange={event => {
+                  void addFiles(event.target.files, 'answer');
+                  event.target.value = '';
+                }}
               />
               <label htmlFor="answer-sheet-files" className="upload-content">
-                <div className="upload-icon"><Upload size={22} /></div>
+                <div className="upload-icon">
+                  <Upload size={22} />
+                </div>
                 <strong>Choose answer sheet files</strong>
                 <span>Photos, scanned pages, PDFs, or text files</span>
                 <small>JPG · PNG · PDF · TXT</small>
               </label>
             </div>
-            {attachments.length > 0 && (
+            {answerFiles.length > 0 && (
               <div className="attachment-list">
-                {attachments.map(file => (
+                {answerFiles.map(file => (
                   <div className="attachment" key={file.id}>
                     <div className="file-icon">
                       {file.type.startsWith('image/') ? <Image size={17} /> : <FileText size={17} />}
                     </div>
                     <div className="file-info">
                       <strong>{file.name}</strong>
-                      <span>{file.type || 'File'} · {(file.size / 1024).toFixed(0)} KB</span>
-                      <span className={file.extractedText && !file.extracting && !file.extractionError ? 'extraction-status' : ''}>{file.extracting ? 'Reading text…' : file.extractionError ? 'Text extraction failed' : file.extractedText ? 'Text extracted' : ''}</span>
+                      <span>
+                        {file.type || 'File'} · {(file.size / 1024).toFixed(0)} KB
+                        {file.pageCount > 1 ? ` · ${file.pageCount} pages` : ''}
+                      </span>
+                      <span className={file.extractedText && !file.extracting && !file.error ? 'extraction-status' : ''}>
+                        {file.extracting
+                          ? 'Reading text…'
+                          : file.error
+                            ? 'Could not read this file'
+                            : file.extractedText
+                              ? 'Text extracted'
+                              : ''}
+                      </span>
                     </div>
-                    <button aria-label={'Remove answer sheet ' + file.name} onClick={() => setAttachments(prev => prev.filter(x => x.id !== file.id))}>
+                    <button aria-label={'Remove answer sheet ' + file.name} onClick={() => removeAttachment('answer', file.id)}>
                       <X size={16} />
                     </button>
                   </div>
                 ))}
-
               </div>
             )}
 
-            <div className="section-heading answer-heading">
-              <div>
-                <span className="step">04</span>
-                <div>
-                  <h2>Enter answers to check</h2>
-                  <p>
-                    Add your answers below to get feedback.
-                  </p>
-                </div>
-              </div>
-              <span className="marks-total">{totalMarks} marks</span>
-            </div>
-            {questions.map((q, index) => (
-              <div className="question-card" key={q.id}>
-                <div className="question-top">
-                  <span className="q-number">Q{index + 1}</span>
+            <details className="manual-entry">
+              <summary>
+                <Plus size={15} /> Add answers manually instead
+              </summary>
+              <p className="hint">
+                Use this when you want to type the questions yourself. Uploaded papers take priority over this section.
+              </p>
+              <div className="manual-total">{totalMarks} marks in typed questions</div>
+              {manual.map((question, index) => (
+                <div className="question-card" key={question.id}>
+                  <div className="question-top">
+                    <span className="q-number">Q{index + 1}</span>
+                    <label>
+                      Marks
+                      <input
+                        aria-label={'Maximum marks for question ' + (index + 1)}
+                        type="number"
+                        min="0"
+                        max="100"
+                        step="0.5"
+                        value={question.marks}
+                        onChange={event => setManualQuestion(question.id, { marks: Number(event.target.value) })}
+                      />
+                    </label>
+                  </div>
                   <label>
-                    Marks for this question
-                    <input
-                      aria-label={'Maximum marks for question ' + (index + 1)}
-                      type="number"
-                      min="0"
-                      max="100"
-                      value={q.marks}
-                      onChange={e =>
-                        updateQuestion(q.id, 'marks', Number(e.target.value))
-                      }
+                    Question
+                    <textarea
+                      value={question.prompt}
+                      onChange={event => setManualQuestion(question.id, { prompt: event.target.value })}
+                      placeholder="Paste or type the question..."
+                      rows={2}
+                    />
+                  </label>
+                  <label>
+                    Your answer
+                    <textarea
+                      value={question.answer}
+                      onChange={event => setManualQuestion(question.id, { answer: event.target.value })}
+                      placeholder="Type your answer as you wrote it..."
+                      rows={3}
+                    />
+                  </label>
+                  <label>
+                    Marking points <span className="label-note">optional</span>
+                    <textarea
+                      value={question.criteria}
+                      onChange={event => setManualQuestion(question.id, { criteria: event.target.value })}
+                      placeholder="Any points your teacher requires, one per line"
+                      rows={2}
                     />
                   </label>
                 </div>
-                <label>
-                  Question
-                  <textarea
-                    value={q.prompt}
-                    onChange={e =>
-                      updateQuestion(q.id, 'prompt', e.target.value)
-                    }
-                    placeholder="Paste or type the question..."
-                    rows={2}
-                  />
-                </label>
-                <label>
-                  Your answer
-                  <textarea
-                    value={q.answer}
-                    onChange={e =>
-                      updateQuestion(q.id, 'answer', e.target.value)
-                    }
-                    placeholder="Type your answer as you wrote it..."
-                    rows={3}
-                  />
-                </label>
+              ))}
+              <button className="add-question" onClick={addManualQuestion}>
+                <Plus size={17} /> Add another question
+              </button>
+            </details>
+
+            {unresolved.length > 0 && (
+              <div className="marks-confirm">
+                <strong>Confirm maximum marks</strong>
+                <p>
+                  The printed maximum could not be verified for these questions. Enter the marks from your paper so nothing
+                  is guessed.
+                </p>
+                {unresolved.map(question => (
+                  <label key={question.key}>
+                    <span>
+                      {question.ref}
+                      <small>{question.text.slice(0, 80)}{question.text.length > 80 ? '…' : ''}</small>
+                    </span>
+                    <input
+                      aria-label={`Maximum marks for ${question.ref}`}
+                      type="number"
+                      min="0.5"
+                      max="100"
+                      step="0.5"
+                      value={overrides[question.key] ?? ''}
+                      onChange={event =>
+                        setOverrides(previous => ({ ...previous, [question.key]: Number(event.target.value) }))
+                      }
+                    />
+                  </label>
+                ))}
               </div>
-            ))}
-            <button className="add-question" onClick={addQuestion}>
-              <Plus size={17} /> Add another question
-            </button>
+            )}
 
             <div className="model-notice">
               <AlertCircle size={18} />
               <div>
-                <strong>Automatic marking</strong>
-                <p>Printed marks and attempt instructions are read from the uploaded question paper. Review unclear scans and estimated scores.</p>
+                <strong>How marking works</strong>
+                <p>
+                  Each answer is marked against its own question and printed maximum, including partial marks. An AI mark is
+                  never accepted without a valid explanation.
+                </p>
               </div>
             </div>
-            {modelStatus && (
+
+            {status && (
               <div className="model-notice" role="status">
                 <Sparkles size={18} />
-                <div><strong>AI status</strong><p>{modelStatus}</p></div>
+                <div>
+                  <strong>Working</strong>
+                  <p>{status}</p>
+                  <button onClick={() => abortRef.current?.abort()}>Stop</button>
+                </div>
               </div>
             )}
+
             {error && (
               <div className="error-banner">
                 <AlertCircle size={17} />
                 <span>{error}</span>
               </div>
             )}
-            <button className="evaluate-button" onClick={evaluate} disabled={!!modelStatus}>
-              <Sparkles size={18} />
-              Run automatic marking{' '}
-              <ArrowRight size={18} />
+
+            <button className="evaluate-button" onClick={() => void evaluate()} disabled={busy || extracting}>
+              {busy || extracting ? <Loader2 size={18} className="spin" /> : <Sparkles size={18} />}
+              {busy ? 'Marking your paper…' : extracting ? 'Reading your files…' : 'Run automatic marking'}{' '}
+              {!busy && !extracting && <ArrowRight size={18} />}
             </button>
           </section>
 
@@ -849,60 +698,93 @@ function App() {
                 <h2>Your evaluation</h2>
               </div>
             </div>
-            {results ? (
+            {report ? (
               <div className="result-panel">
                 <div className="score-block">
-                  <span>{resultMethod === 'ai' ? 'Estimated score' : 'Marking-point score'}</span>
+                  <span>Estimated score</span>
                   <div>
-                    <strong>{awarded}</strong>
-                    <span> / {maxAwarded}</span>
+                    <strong>{formatMarks(report.awarded)}</strong>
+                    <span> / {formatMarks(report.paperTotal)}</span>
                   </div>
                   <div className="score-track">
-                    <span
-                      style={{
-                        width: maxAwarded
-                          ? (awarded / maxAwarded) * 100 + '%'
-                          : '0%',
-                      }}
-                    />
+                    <span style={{ width: percentage + '%' }} />
                   </div>
                   <small>
-                    {maxAwarded ? Math.round((awarded / maxAwarded) * 100) : 0}%
-                    · Review before relying on this score
+                    {percentage}% · {report.gradedCount} marked · {report.unattemptedCount} not attempted
+                    {report.unresolvedCount ? ` · ${report.unresolvedCount} need review` : ''}
                   </small>
+                  {!report.complete && (
+                    <p className="provisional">
+                      Partial result: {report.unresolvedCount} answer{report.unresolvedCount === 1 ? '' : 's'} could not be
+                      verified and {report.unresolvedCount === 1 ? 'is' : 'are'} not counted in the total.
+                    </p>
+                  )}
                 </div>
-                {results.map((r, i) => (
-                  <div className="result-question" key={r.id}>
+
+                {report.warnings.length > 0 && (
+                  <details className="report-notes">
+                    <summary>Marking notes ({report.warnings.length})</summary>
+                    <ul>
+                      {report.warnings.map((warning, index) => (
+                        <li key={index}>{warning}</li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+
+                {report.grades.map(question => (
+                  <div className="result-question" key={question.key}>
                     <div className="result-q-head">
-                      <strong>{r.ref || 'Question ' + (i + 1)}</strong>
-                      <b>
-                        {r.score} / {r.max}
-                      </b>
+                      <strong>{question.ref}</strong>
+                      <span className="result-score">
+                        <span className={`status-chip ${question.status}`}>{STATUS_LABEL[question.status]}</span>
+                        <b>{question.status === 'unresolved' ? '—' : `${formatMarks(question.awarded)} / ${formatMarks(question.max)}`}</b>
+                      </span>
                     </div>
-                    {r.matched.length > 0 && (
-                      <p className="good">
-                        <CheckCircle2 size={14} /> Matched:{' '}
-                        {r.matched.join(', ')}
+                    {question.status === 'unresolved' ? (
+                      <p className="result-note">
+                        {question.error ?? 'This answer could not be marked automatically.'} It was not recorded as zero.
                       </p>
+                    ) : (
+                      <>
+                        {question.correctPoints.length > 0 && (
+                          <div className="point-list good">
+                            {question.correctPoints.map((point, index) => (
+                              <p key={index}>
+                                <CheckCircle2 size={13} /> {point}
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                        {question.missingPoints.length > 0 && (
+                          <div className="point-list missing">
+                            {question.missingPoints.map((point, index) => (
+                              <p key={index}>
+                                <AlertCircle size={13} /> {point}
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                        {question.mistakes.length > 0 && (
+                          <div className="point-list mistake">
+                            {question.mistakes.map((mistake, index) => (
+                              <p key={index}>
+                                <X size={13} /> {mistake}
+                              </p>
+                            ))}
+                          </div>
+                        )}
+                        <p className="result-note">{question.feedback}</p>
+                        {question.confidence && <span className="confidence">Confidence: {question.confidence}</span>}
+                      </>
                     )}
-                    {r.missing.length > 0 && (
-                      <p className="missing">
-                        <AlertCircle size={14} /> Not found:{' '}
-                        {r.missing.join(', ')}
-                      </p>
-                    )}
-                    <p className="result-note">{r.note}</p>
                   </div>
                 ))}
-                <button
-                  className="secondary-button"
-                  onClick={() => {
-                    setResults(null);
-                    setError('');
-                  }}
-                >
+
+                <button className="secondary-button" onClick={() => setReport(null)}>
                   Edit answers
                 </button>
+                <p className="provider-note">Marked with {report.provider} · {report.model}</p>
               </div>
             ) : (
               <div className="empty-results">
@@ -911,47 +793,47 @@ function App() {
                   <span>✦</span>
                 </div>
                 <h3>Your marks will appear here</h3>
-                <p>
-                  Add a question and answer, then check your results here.
-                </p>
+                <p>Upload your question paper and answer sheet, then run automatic marking.</p>
                 <div className="empty-checks">
                   <span>
-                    <CheckCircle2 size={15} /> Question-wise feedback
+                    <CheckCircle2 size={15} /> Question-wise marks
                   </span>
                   <span>
-                    <CheckCircle2 size={15} /> Missing marking points
+                    <CheckCircle2 size={15} /> Missing points and mistakes
                   </span>
                   <span>
-                    <CheckCircle2 size={15} /> Score summary
+                    <CheckCircle2 size={15} /> Score that adds up
                   </span>
                 </div>
               </div>
             )}
+
             <div className="trust-card">
               <ShieldCheck size={19} />
               <div>
                 <strong>Designed for transparent marking</strong>
-                <p>
-                  Every deduction should be explainable. Uncertain answers
-                  should be flagged for review, not confidently marked wrong.
-                </p>
+                <p>Every deduction is explained. Answers that cannot be verified are flagged for review instead of being marked wrong.</p>
               </div>
             </div>
+
             <div className="next-card">
               <div className="next-icon">
                 <Sparkles size={17} />
               </div>
               <div>
-                <strong>Managed AI mode</strong>
-                <p>AI grading runs on the server to avoid large first-use downloads. Photo OCR and scanned-PDF OCR run locally in English and Hindi, one page at a time. Review extracted text and every estimated score.</p>
+                <strong>Free AI examiner</strong>
+                <p>
+                  Marking uses DeepSeek through Puter.js, with no API key needed. Scanned pages are read on your device in
+                  English and Hindi. Review every estimated score before relying on it.
+                </p>
                 <span>Experimental · review all scores</span>
               </div>
             </div>
           </aside>
         </div>
+
         <footer>
-          Paperwise <span>·</span> Independent prototype <span>·</span> Not
-          connected to CRAM AI
+          Paperwise <span>·</span> Independent prototype <span>·</span> Not connected to CRAM AI
         </footer>
       </main>
     </div>

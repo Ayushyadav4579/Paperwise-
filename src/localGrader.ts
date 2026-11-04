@@ -113,8 +113,9 @@ function extractAssistantText(output: Array<{ generated_text: string | Array<{ r
   if (typeof generated === 'string') return generated.trim();
   if (Array.isArray(generated)) {
     for (let i = generated.length - 1; i >= 0; i--) {
-      if (generated[i]?.role === 'assistant' && typeof generated[i]?.content === 'string') {
-        return generated[i].content.trim();
+      const message = generated[i];
+      if (message?.role === 'assistant' && typeof message.content === 'string') {
+        return message.content.trim();
       }
     }
     const last = generated[generated.length - 1];

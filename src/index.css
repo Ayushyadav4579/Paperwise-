@@ -978,3 +978,252 @@ footer span {
     font-size: 10px;
   }
 }
+
+/* --- Paper structure, manual entry and evaluation report ---------------- */
+.spin {
+  animation: paperwise-spin 1s linear infinite;
+}
+@keyframes paperwise-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.manual-entry {
+  border: 1px dashed #d9e3d6;
+  border-radius: 11px;
+  padding: 13px 15px;
+  background: #fbfcfa;
+  margin-top: 14px;
+}
+.manual-entry summary {
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  font-size: 12px;
+  font-weight: 700;
+  color: #3d7256;
+  list-style: none;
+}
+.manual-entry summary::-webkit-details-marker {
+  display: none;
+}
+.manual-entry .question-card {
+  margin-top: 12px;
+  background: #fff;
+}
+.manual-total {
+  font-size: 10px;
+  color: #8a958c;
+  margin-top: 8px;
+}
+.warn-list {
+  margin: 10px 0 0;
+  padding: 11px 13px;
+  border-radius: 9px;
+  background: #fdf8ec;
+  border: 1px solid #f0e4c8;
+}
+.warn-list p {
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  margin: 0 0 6px;
+  font-size: 10px;
+  line-height: 1.55;
+  color: #8a6a25;
+}
+.warn-list p:last-child {
+  margin-bottom: 0;
+}
+.paper-summary {
+  border: 1px solid #e3e9e1;
+  border-radius: 11px;
+  background: #fff;
+  padding: 14px;
+  margin-top: 12px;
+}
+.paper-summary-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+}
+.paper-summary-head strong {
+  font-size: 12px;
+  color: #26483a;
+}
+.paper-summary-head span {
+  font-size: 10px;
+  color: #6f8a78;
+}
+.ref-chips {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  margin-top: 9px;
+}
+.ref-chip {
+  font-size: 9.5px;
+  font-weight: 600;
+  color: #3c6b52;
+  background: #eef5ef;
+  border: 1px solid #dce9dd;
+  border-radius: 20px;
+  padding: 3px 8px;
+  white-space: nowrap;
+}
+.ref-chip.missing-mark {
+  color: #96692a;
+  background: #fcf5e7;
+  border-color: #f0e0bd;
+}
+.marks-confirm {
+  border: 1px solid #f0e0bd;
+  background: #fffdf7;
+  border-radius: 11px;
+  padding: 14px;
+  margin-top: 14px;
+}
+.marks-confirm strong {
+  font-size: 12px;
+  color: #7d5c1f;
+}
+.marks-confirm p {
+  font-size: 10px;
+  line-height: 1.6;
+  color: #8b7443;
+  margin: 6px 0 10px;
+}
+.marks-confirm label {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 7px 0;
+  border-top: 1px solid #f3ead7;
+  font-size: 11px;
+  font-weight: 600;
+  color: #5f6c60;
+}
+.marks-confirm label small {
+  display: block;
+  font-weight: 400;
+  font-size: 9px;
+  color: #a09a87;
+  max-width: 240px;
+  line-height: 1.4;
+  margin-top: 3px;
+}
+.marks-confirm input {
+  width: 66px;
+  flex-shrink: 0;
+  border: 1px solid #e2d9c4;
+  border-radius: 7px;
+  padding: 7px 8px;
+  font-size: 12px;
+  background: #fff;
+  color: #4a4436;
+}
+.result-score {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+}
+.status-chip {
+  font-size: 8.5px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  border-radius: 20px;
+  padding: 3px 7px;
+  text-transform: uppercase;
+  background: #edf4ee;
+  color: #4a7a5c;
+  white-space: nowrap;
+}
+.status-chip.unattempted {
+  background: #f1f2ef;
+  color: #8b9288;
+}
+.status-chip.unresolved {
+  background: #fcf1e3;
+  color: #a1732c;
+}
+.point-list {
+  margin: 7px 0 0;
+}
+.point-list p {
+  display: flex;
+  align-items: flex-start;
+  gap: 5px;
+  margin: 0 0 4px;
+  font-size: 10px;
+  line-height: 1.5;
+}
+.point-list svg {
+  flex-shrink: 0;
+  margin-top: 1px;
+}
+.point-list.good p {
+  color: #46865b;
+}
+.point-list.missing p {
+  color: #9a7529;
+}
+.point-list.mistake p {
+  color: #a2574f;
+}
+.confidence {
+  display: inline-block;
+  margin-top: 7px;
+  font-size: 9px;
+  color: #96a096;
+}
+.provisional {
+  margin: 9px 0 0;
+  font-size: 9.5px;
+  line-height: 1.5;
+  color: #94692a;
+  background: #fcf4e4;
+  border-radius: 6px;
+  padding: 7px 8px;
+}
+.report-notes {
+  margin-top: 12px;
+}
+.report-notes summary {
+  cursor: pointer;
+  font-size: 10px;
+  font-weight: 700;
+  color: #6a7d6d;
+}
+.report-notes ul {
+  margin: 8px 0 0;
+  padding-left: 16px;
+}
+.report-notes li {
+  font-size: 9.5px;
+  line-height: 1.55;
+  color: #8b938a;
+  margin-bottom: 4px;
+}
+.provider-note {
+  margin: 10px 0 0;
+  font-size: 8.5px;
+  color: #a5ada4;
+  text-align: center;
+}
+@media (max-width: 760px) {
+  .marks-confirm label {
+    flex-wrap: wrap;
+  }
+  .marks-confirm label small {
+    max-width: 100%;
+  }
+  .paper-summary-head {
+    flex-wrap: wrap;
+  }
+  .point-list p {
+    font-size: 10.5px;
+  }
+}
