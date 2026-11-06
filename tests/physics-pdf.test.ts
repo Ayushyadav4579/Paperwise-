@@ -12,6 +12,8 @@ import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { normaliseExtractedText, reconstructPageLines } from '../src/extraction/layout';
 import { parsePaper } from '../src/exam/paper';
+import { evaluatePaper } from '../src/exam/grade';
+import { decisionChat } from './helpers';
 
 const PDF = 'tests/fixtures/physics/physics-paper.pdf';
 const SCAN = 'tests/fixtures/physics/physics-paper-scan.pdf';
@@ -75,6 +77,30 @@ describe.skipIf(!available)('Class XI Physics paper: real PDF', () => {
     expect(text).toMatch(/Taking\ng = 10 m\/s2, calculate its maximum height\. 1/);
     expect(paper.questions.find(question => question.ref === 'Q3')?.text).toContain('calculate its maximum height');
     expect(paper.questions.some(question => question.text === 'g = 10 m/s2, calculate its maximum height.')).toBe(false);
+  });
+
+  it('marks the real PDF end to end, from bytes to a report out of 25', async () => {
+    const { text } = await readPdf(PDF);
+    const paper = parsePaper(text);
+    const answers = `Q1. (b) velocity
+Q2. (c) acceleration
+Q3. H = u^2/2g = 20 m
+Q4. F = dp/dt = ma
+Q5. W = F s, joule
+Q6. (a) T = 2 s. (b) H = 5 m. (c) R = 34.6 m.
+Q7. (a) Weight 50 N down, normal 50 N up, applied 25 N forward, friction 15 N backward. (b) f = 0.3 x 50 = 15 N. (c) a = 10/5 = 2 m/s2.`;
+    const report = await evaluatePaper({
+      paper,
+      answerText: answers,
+      board: 'CBSE',
+      grade: 'Class 11',
+      chat: decisionChat((_ref, max) => ({ awarded: max, feedback: 'Correct part, credited against the printed maximum.' })),
+    });
+    expect(report.paperTotal).toBe(25);
+    expect(report.gradedCount).toBe(11);
+    expect(report.awarded).toBe(25);
+    expect(report.complete).toBe(true);
+    expect(Math.round((report.awarded / report.paperTotal) * 100)).toBe(100);
   });
 
   it('treats the scanned PDF as a real scan with no text layer', async () => {
