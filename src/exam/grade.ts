@@ -13,7 +13,7 @@ import {
   type GradingContext,
   type GradingItem,
 } from './prompt';
-import { containsVerbatim, normaliseForMatch, refKey } from './text';
+import { containsVerbatim, displayRef, normaliseForMatch, refKey } from './text';
 
 // A paper is marked in batches of four with three in flight, so the old 60
 // question ceiling was far below what the provider and the browser can handle.
@@ -337,6 +337,66 @@ async function locateUnlabelledAnswers(input: {
   return found;
 }
 
+function splitPartAnswer(text: string, children: PaperQuestion[]): Map<string, string> | null {
+  const markers = [...text.matchAll(/\(([a-h])\)\s*/gi)];
+  if (markers.length < 2) return null;
+  const found = new Map<string, string>();
+  for (const [index, marker] of markers.entries()) {
+    const key = `${children[0].parentKey}${marker[1].toUpperCase()}`;
+    if (!children.some(child => child.key === key)) continue;
+    const from = (marker.index ?? 0) + marker[0].length;
+    const to = markers[index + 1]?.index ?? text.length;
+    const slice = text.slice(from, to).trim();
+    if (slice) found.set(key, slice);
+  }
+  return found.size ? found : null;
+}
+
+/**
+ * A student often answers a multi-part question in one block under `Q6`
+ * without repeating `(a)`, `(b)`, `(c)`. The parts must still be marked
+ * independently, so this splits such a block on its printed part labels and
+ * otherwise judges each part against the whole block, saying so in the report.
+ */
+function distributePartAnswers(
+  questions: PaperQuestion[],
+  answers: Map<string, string>,
+  warnings: string[]
+): void {
+  const children = new Map<string, PaperQuestion[]>();
+  const byKey = new Map<string, PaperQuestion>();
+  for (const question of questions) {
+    byKey.set(question.key, question);
+    if (question.parentKey === question.key) continue;
+    const list = children.get(question.parentKey) ?? [];
+    list.push(question);
+    children.set(question.parentKey, list);
+  }
+
+  // A sheet may label the whole question (`Q6. (a) ... (b) ...`) or start at
+  // the first part (`Q6. (a) ...`). Either way the parts must be marked
+  // separately, so the parent's answer text is split on its part markers.
+  for (const [key, text] of [...answers]) {
+    const parent = byKey.get(key)?.parentKey ?? key;
+    const parts = children.get(parent);
+    if (!parts?.length || parts.length < 2) continue;
+    const split = splitPartAnswer(text, parts);
+    if (split) {
+      for (const [partKey, partText] of split) {
+        if (!answers.has(partKey)) answers.set(partKey, partText);
+      }
+      continue;
+    }
+    if (key !== parent) continue;
+    for (const part of parts) {
+      if (!answers.has(part.key)) answers.set(part.key, text);
+    }
+    warnings.push(
+      `The answer for ${displayRef(parent)} was not split into its parts, so each part was judged against the whole answer.`
+    );
+  }
+}
+
 export type MarksResolution = {
   paper: Paper;
   notes: string[];
@@ -477,6 +537,7 @@ export async function evaluatePaper(options: EvaluateOptions): Promise<Evaluatio
   for (const segment of segmentation.segments) {
     if (segment.text.trim()) answers.set(segment.key, segment.text);
   }
+  distributePartAnswers(questions, answers, warnings);
 
   let missing = questionsToMark.filter(question => !answers.has(question.key));
   const shouldLocate =

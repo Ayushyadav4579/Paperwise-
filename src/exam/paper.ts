@@ -10,17 +10,44 @@ import { pageNumberFromMarker } from '../extraction/layout';
  * instruction ("each question carries 2 marks"). When none of those exists the
  * question is left unresolved instead of guessing, and the UI asks the student
  * to confirm the marks.
+ *
+ * Question boundaries are the fragile part of real papers. PDF text layers and
+ * OCR both merge lines, so a question number is not always at the start of a
+ * line: `... (d) mass 1 2. The slope ...` is one extracted line containing two
+ * questions. The parser therefore expands a line whenever the *next expected*
+ * question number appears inside it, which is far safer than splitting on any
+ * `digit + dot`.
  */
 
 const SECTION_RE = /^(?:section|part|भाग|खंड)\s*[-–—:]?\s*([A-Za-z0-9]{1,3})\b(.*)$/i;
-const PREFIXED_QUESTION_RE = /^q(?:uestion)?\s*[.:]?\s*(\d{1,3})\s*(?:[.)\]:-]\s*|\s+)([^\d\s].*)$/i;
-const NUMBERED_QUESTION_RE = /^(\d{1,3})\s*[.)\]:-]\s+([^\d\s].*)$/;
-const MCQ_CUE_RE = /\b(?:choose|select|tick|which\s+of\s+the\s+following|correct\s+option|multiple\s+choice)\b/i;
+// OCR reads a printed `Q` as `O` or `0`, so all three are accepted as a label.
+const QUESTION_LABEL = '(?:q(?:uestion)?|प्रश्न|o|0)';
+// A question number is a line-leading number with a separator. `(?!\d)` after
+// the separator rejects decimals such as `1.5 moles` without rejecting
+// `1. 25 ml of acid ...`.
+const QUESTION_START_RE = new RegExp(
+  `^(${QUESTION_LABEL}\\s*[.:]?\\s*)?\\(?(\\d{1,3}|[lI])\\)?\\s*([.):\\],;:\\-–—])(?!\\d)\\s*(.*)$`,
+  'i'
+);
+// `Q4 Explain ...` without punctuation is accepted only with an explicit label,
+// so a wrapped sentence beginning with a number is not a question.
+const QUESTION_SPACED_RE = new RegExp(
+  `^(${QUESTION_LABEL})\\s*[.:]?\\s*(\\d{1,3})\\s+(?=[^\\d\\s])(.*)$`,
+  'i'
+);
+// A question number in the middle of an extracted line. OCR frequently reads
+// `Q` as `O` or `0` and `1` as `l`, so those prefixes and glyphs are accepted.
+const INLINE_START_RE = new RegExp(
+  `(^|[\\s])(${QUESTION_LABEL}\\s*[.:]?\\s*)?(\\d{1,3}|[lI])\\s*([.):\\],;:\\-–—])(?!\\d)\\s*(?=[A-Za-z(\\u0900-\\u097F"“'])`,
+  'gi'
+);
+const MCQs = /\b(?:choose|select|tick|which\s+of\s+the\s+following|correct\s+option|multiple\s+choice)\b/i;
 const SUBPART_RE = /^\(([a-h])\)\s*(.*)$/i;
 const ROMAN_SUBPART_RE = /^\((i|ii|iii|iv|v|vi|vii|viii|ix|x)\)\s*(.*)$/i;
 const CHOICE_RE = /^(?:or|अथवा)\b\s*[.:;,\-–—]?\s*(.*)$/i;
 const DISTRIBUTION_RE = /\b(\d{1,2})\s*[x×*]\s*(\d{1,2})\s*=\s*(\d{1,3})\b/i;
-const EACH_MARKS_RE = /(?:each|every|प्रत्येक|all)\s+(?:of\s+the\s+)?(?:questions?|one\s+question)?[^.\n]{0,60}?(\d{1,3}(?:\.\d+)?)\s*(?:marks?|अंक)/i;
+const EACH_MARKS_RE =
+  /(?:each|every|प्रत्येक|all)\s+(?:of\s+the\s+)?(?:questions?|one\s+question)?[^.\n]{0,60}?(\d{1,3}(?:\.\d+)?)\s*(?:marks?|अंक)/i;
 // Require whitespace before the bracket so mathematical notation such as
 // `f(2)` or `x(3)` is never read as a printed mark.
 const TRAILING_MARKS_RE = /(?:^|\s)[\[(]\s*(\d{1,3}(?:\.\d+)?)\s*(?:marks?|अंक|m|M)?\s*[\])]\s*$/;
@@ -32,6 +59,9 @@ const TRAILING_DISTRIBUTION_RE =
 const INSTRUCTION_HEADER_RE = /^(?:general\s+)?instructions?\b|^instructions?\s+to\s+(?:the\s+)?candidates?/i;
 const INSTRUCTION_LINE_RE =
   /\b(?:attempt|compulsory|carry|carries|marks?|write|answer\s+all|question\s+paper|time\s+allowed|internal\s+choice|choose|section|read\s+the\s+following|all\s+questions|each\s+question|blue|black|dark|pencil|diagram|total)\b/i;
+const PAGE_NUMBER_RE = /^(?:page\s*)?\d{1,3}\s*(?:\||\/|of)\s*(?:page\s*)?\d{1,3}$|^page\s+\d{1,3}$/i;
+
+type MarksInfo = { max: number; evidence: string };
 
 type Draft = {
   number: number;
@@ -45,12 +75,8 @@ type Draft = {
   /** Marks rule that was active in this question's own section. */
   sectionMarks: MarksInfo | null;
   page: number | null;
-  parentTotal: number | null;
-  parentEvidence: string | null;
   parts: Draft[];
 };
-
-type MarksInfo = { max: number; evidence: string };
 
 type SectionDraft = PaperSection & { key: string };
 
@@ -71,13 +97,134 @@ function lastMatch(text: string, pattern: RegExp): RegExpMatchArray | null {
   return found;
 }
 
+function questionNumber(raw: string, hasPrefix: boolean): number | null {
+  if (/^[lI]$/.test(raw)) return hasPrefix ? 1 : null;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value < 1 || value > 200) return null;
+  return value;
+}
+
+/** Parse a question number at the very start of a line. */
+function questionStart(line: string): { number: number; rest: string } | null {
+  const match = line.match(QUESTION_START_RE);
+  if (match) {
+    const number = questionNumber(match[2], !!match[1]);
+    if (number !== null) return { number, rest: cleanInline(match[4] ?? '') };
+  }
+  const spaced = line.match(QUESTION_SPACED_RE);
+  if (spaced) {
+    const number = questionNumber(spaced[2], true);
+    if (number !== null) return { number, rest: cleanInline(spaced[3] ?? '') };
+  }
+  return null;
+}
+
+/** Every place in a line that looks like the start of a numbered question. */
+function inlineStarts(line: string): Array<{ number: number; index: number }> {
+  const found: Array<{ number: number; index: number }> = [];
+  const regex = new RegExp(INLINE_START_RE.source, 'gi');
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(line)) !== null) {
+    const number = questionNumber(match[3], !!match[2]);
+    if (match[0].length === 0) regex.lastIndex++;
+    if (number === null) continue;
+    const index = match.index + (match[1]?.length ?? 0);
+    found.push({ number, index });
+  }
+  return found;
+}
+
+/**
+ * Split one extracted line into the questions it actually contains.
+ *
+ * Only the *next expected* numbers are accepted, so text such as `2.5 moles`,
+ * `20 m/s`, `Fig. 3` and page numbers cannot start a question. Returns `[line]`
+ * when there is nothing to split.
+ */
+function expandLine(line: string, expected: number): string[] {
+  const starts = inlineStarts(line);
+  const cuts: number[] = [];
+  let next = expected;
+  for (const start of starts) {
+    if (start.number !== next) continue;
+    cuts.push(start.index);
+    next += 1;
+  }
+  const splits = cuts.filter((cut, index) => cut > 0 || index < cuts.length - 1);
+  if (!splits.length) return [line];
+  const pieces: string[] = [];
+  if (cuts[0] > 0) pieces.push(line.slice(0, cuts[0]));
+  cuts.forEach((cut, index) => {
+    const piece = line.slice(cut, cuts[index + 1] ?? line.length).trim();
+    if (piece) pieces.push(piece);
+  });
+  return pieces.length ? pieces : [line];
+}
+
+type PartRun = { stem: string; parts: Array<{ label: string; text: string }> };
+
+/**
+ * Split `6. A projectile ... (a) time of flight. 2 (b) height. 3` into a stem
+ * and parts. A row of MCQ options such as `(a) speed (b) velocity ... 1` looks
+ * similar, so a run only counts as sub-parts when at least two segments carry
+ * their own printed mark.
+ */
+function splitPartRun(text: string, usesRoman: boolean): PartRun | null {
+  const markers = [...text.matchAll(/\(([a-h]|i{1,3}|iv|v|vi{1,3}|ix|x)\)\s*/gi)];
+  if (markers.length < 2) return null;
+  const labels = markers.map(match => match[1].toLowerCase());
+  const roman = labels.every(label => isRoman(label));
+  const letters = labels.every(label => /^[a-h]$/.test(label));
+  if (!roman && !letters) return null;
+  const sequence = roman ? ['i', 'ii', 'iii', 'iv', 'v', 'vi', 'vii', 'viii', 'ix', 'x'] : ['a', 'b', 'c', 'd', 'e', 'f', 'g', 'h'];
+  const startAt = sequence.indexOf(labels[0]);
+  if (startAt < 0) return null;
+  for (let index = 0; index < labels.length; index++) {
+    if (sequence[startAt + index] !== labels[index]) return null;
+  }
+  if (roman && !usesRoman) return null;
+  const parts = markers.map((marker, index) => {
+    const from = marker.index! + marker[0].length;
+    const to = markers[index + 1]?.index ?? text.length;
+    return { label: marker[1].toLowerCase(), text: cleanInline(text.slice(from, to)) };
+  });
+  if (parts.some(part => part.text.length < 2)) return null;
+  const marked = parts.filter(part => bareTrailingMarks(part.text, false) !== null).length;
+  if (marked < 2) return null;
+  return { stem: cleanInline(text.slice(0, markers[0].index)), parts };
+}
+
+function looksLikeOptionRow(line: string): boolean {
+  const labels = [...line.matchAll(/(?:^|\s)\(([a-h])\)\s+/gi)].map(match => match[1].toLowerCase());
+  if (labels.length < 3) return false;
+  return new Set(labels).size >= 3;
+}
+
+/**
+ * Marks printed as a plain trailing number, e.g. `... maximum height. 1`.
+ * A bare number is only trusted after sentence punctuation, or at the end of an
+ * option row (`(d) mass 1`). This keeps `speed of 20`, `g = 10` and years out.
+ */
+function bareTrailingMarks(text: string, optionRow: boolean): MarksInfo | null {
+  const match = text.match(/(\d{1,2}(?:\.\d+)?)\s*$/);
+  if (!match || match.index === undefined) return null;
+  const max = clampMarks(Number(match[1]));
+  if (max === null || max > 20) return null;
+  const before = text.slice(0, match.index).trimEnd();
+  if (before.length < 8) return null;
+  if (!optionRow && !/[.?!:;)\]]$/.test(before)) return null;
+  return { max, evidence: `“${before.slice(-32)} ${match[1]}”` };
+}
+
 function marksFromText(lines: string[]): MarksInfo | null {
   // An MCQ's option row comes after the printed mark, e.g.
-  // "1. Which ...? (1)" followed by "(a) coal (b) gas ...". Reading the whole
-  // block put the option row last, so the trailing-mark rule missed Q1.
+  // "1. Which ...? (1)" followed by "(a) coal (b) gas ...". Reading option rows
+  // as marks was avoided before, but a paper may print the mark at the end of
+  // the option row, so those lines are used explicitly below.
+  const optionRow = lines.find(line => looksLikeOptionRow(line)) ?? null;
   const stem = lines.filter(line => !looksLikeOptionRow(line));
   const text = cleanInline(stem.join(' '));
-  if (!text) return null;
+  const full = cleanInline(lines.join(' '));
 
   const distribution = text.match(TRAILING_DISTRIBUTION_RE);
   if (distribution) {
@@ -98,7 +245,12 @@ function marksFromText(lines: string[]): MarksInfo | null {
     const max = clampMarks(Number(word[1]));
     if (max !== null) return { max, evidence: word[0] };
   }
-  return null;
+
+  if (optionRow) {
+    const rowMark = bareTrailingMarks(full, true);
+    if (rowMark) return rowMark;
+  }
+  return bareTrailingMarks(text, false);
 }
 
 function stripMarksMarker(text: string): string {
@@ -107,7 +259,15 @@ function stripMarksMarker(text: string): string {
       .replace(TRAILING_MARKS_RE, '')
       .replace(TRAILING_DISTRIBUTION_RE, '')
       .replace(/\s*[\[(]\s*\d{1,3}(?:\.\d+)?\s*(?:marks?|अंक|m|M)?\s*[\])]\s*$/gi, ' ')
+      // A plain mark after sentence punctuation is not part of the question.
+      .replace(/([.?!:;)\]])\s+\d{1,2}(?:\.\d+)?\s*$/, '$1')
   );
+}
+
+/** Remove a bare mark that was printed at the end of an option row. */
+function stripBareOptionMark(text: string, marks: MarksInfo | null): string {
+  if (!marks || !/\d/.test(marks.evidence)) return text;
+  return cleanInline(text.replace(/\s+\d{1,2}(?:\.\d+)?\s*$/, ''));
 }
 
 /** Extract per-question marks printed once for a whole section header. */
@@ -134,12 +294,6 @@ function globalMarksFromRule(rule: string): MarksInfo | null {
   return max === null ? null : { max, evidence: match[0] };
 }
 
-function looksLikeOptionRow(line: string): boolean {
-  const labels = [...line.matchAll(/(?:^|\s)\(([a-h])\)\s+/gi)].map(match => match[1].toLowerCase());
-  if (labels.length < 3) return false;
-  return new Set(labels).size >= 3;
-}
-
 function subpartLabel(line: string, usesRoman: boolean, existingParts: Draft[]): { label: string; rest: string } | null {
   const roman = line.match(ROMAN_SUBPART_RE);
   const letter = line.match(SUBPART_RE);
@@ -162,53 +316,25 @@ function buildQuestionText(lines: string[]): string {
   return stripMarksMarker(lines.join(' '));
 }
 
-function finaliseDraft(draft: Draft, sectionMarks: MarksInfo | null, globalMarks: MarksInfo | null) {
-  const questionText = buildQuestionText(draft.lines);
-  const choiceText = draft.choiceLines ? buildQuestionText(draft.choiceLines) || null : null;
-  const own = marksFromText(draft.lines);
-  const ownChoice = draft.choiceLines ? marksFromText(draft.choiceLines) : null;
-
-  if (draft.parts.length) {
-    const parentMarks = own ?? ownChoice;
-    const parts = draft.parts
-      .map(part => {
-        const partLines = [...part.lines, ...(part.choiceLines ?? [])];
-        const partMarks = marksFromText(part.lines) ?? marksFromText(partLines);
-        return {
-          draft: part,
-          text: buildQuestionText(part.lines),
-          choiceText: part.choiceLines ? buildQuestionText(part.choiceLines) || null : null,
-          marks: partMarks,
-        };
-      })
-      .filter(part => part.text.length >= 2);
-
-    const explicitSum = parts.reduce(
-      (sum, part) => sum + (part.marks?.max ?? 0),
-      0
-    );
-    const allPartsHaveMarks = parts.length > 0 && parts.every(part => part.marks);
-
-    return {
-      text: questionText,
-      choiceText,
-      parentMarks,
-      parts,
-      explicitSum,
-      allPartsHaveMarks,
-    };
-  }
-
-  return {
-    text: questionText,
-    choiceText,
-    parentMarks: own ?? ownChoice,
-    parts: [] as Array<{ draft: Draft; text: string; choiceText: string | null; marks: MarksInfo | null }>,
-    explicitSum: 0,
-    allPartsHaveMarks: false,
-    sectionMarks,
-    globalMarks,
-  };
+/**
+ * A multi-part question usually prints one total (8) and no per-part marks, or
+ * per-part marks and no total. When only the total is printed, the total is
+ * divided across the parts so the paper total stays correct; the split is
+ * reported to the student rather than hidden.
+ */
+function allocateMarks(total: number, values: Array<number | null>): number[] | null {
+  const missing = values.filter(value => value === null).length;
+  if (!missing) return null;
+  const known = values.reduce<number>((sum, value) => sum + (value ?? 0), 0);
+  const cents = Math.round((total - known) * 100);
+  if (cents <= 0) return null;
+  const each = Math.floor(cents / missing);
+  let extra = cents - each * missing;
+  return values.map(value => {
+    if (value !== null) return value;
+    const share = each + (extra-- > 0 ? 1 : 0);
+    return share / 100;
+  });
 }
 
 export function parsePaper(rawText: string): Paper {
@@ -224,6 +350,7 @@ export function parsePaper(rawText: string): Paper {
   let currentTop: Draft | null = null;
   let currentPart: Draft | null = null;
   let inChoice = false;
+  let expected = 1;
 
   const lines = toLines(rawText);
   const usesRoman = /\((?:ii|iii|iv|vi|vii|viii|ix)\)/i.test(rawText);
@@ -239,8 +366,6 @@ export function parsePaper(rawText: string): Paper {
       section: currentSection?.name ?? '',
       sectionMarks,
       page,
-      parentTotal: null,
-      parentEvidence: null,
       parts: [],
       mcq: false,
     };
@@ -248,6 +373,7 @@ export function parsePaper(rawText: string): Paper {
     currentTop = draft;
     currentPart = null;
     inChoice = false;
+    expected = number + 1;
     return draft;
   };
 
@@ -262,8 +388,6 @@ export function parsePaper(rawText: string): Paper {
       section: parent.section,
       sectionMarks: parent.sectionMarks,
       page,
-      parentTotal: null,
-      parentEvidence: null,
       parts: [],
       mcq: false,
     };
@@ -285,18 +409,42 @@ export function parsePaper(rawText: string): Paper {
     target.lines.push(text);
   };
 
-  const isMultipleChoice = (draft: Draft | null): boolean =>
-    !!draft && (draft.mcq || MCQ_CUE_RE.test(draft.lines.join(' ')));
+  /** Turn an inline `(a) ... 2 (b) ... 3` run into real sub-parts. */
+  const consumePartRun = (parent: Draft, text: string): boolean => {
+    const run = splitPartRun(text, usesRoman);
+    if (!run) return false;
+    if (run.stem) parent.lines.push(run.stem);
+    for (const part of run.parts) startPart(parent, part.label, part.text);
+    return true;
+  };
 
-  for (let index = 0; index < lines.length; index++) {
-    const raw = lines[index];
-    const trimmed = raw.trim();
+  const isMultipleChoice = (draft: Draft | null): boolean =>
+    !!draft && (draft.mcq || MCQs.test(draft.lines.join(' ')));
+
+  const pending: string[] = [];
+  for (let index = 0; index < lines.length || pending.length; ) {
+    const rawLine = pending.length ? pending.shift()! : lines[index++];
+    let trimmed = rawLine.trim();
     if (!trimmed) continue;
 
     const markerPage = pageNumberFromMarker(trimmed);
     if (markerPage !== null) {
       page = markerPage;
       continue;
+    }
+
+    // Break `... 1 2. The slope ...` into two questions before any other rule
+    // sees it. Instructions are exempt because their numbered rules would
+    // otherwise be mistaken for question numbers.
+    if (!inInstructions) {
+      const start = questionStart(trimmed);
+      const base = start ? start.number + 1 : expected;
+      const pieces = expandLine(trimmed, base);
+      if (pieces.length > 1) {
+        trimmed = pieces[0].trim();
+        if (!trimmed) continue;
+        pending.unshift(...pieces.slice(1));
+      }
     }
 
     const sectionMatch = trimmed.length <= 160 ? trimmed.match(SECTION_RE) : null;
@@ -345,17 +493,26 @@ export function parsePaper(rawText: string): Paper {
       }
     }
 
-    const prefixed = trimmed.match(PREFIXED_QUESTION_RE);
-    const numberedQuestion = prefixed ? null : trimmed.match(NUMBERED_QUESTION_RE);
-    const questionMatch = prefixed ?? numberedQuestion;
+    if (PAGE_NUMBER_RE.test(trimmed)) continue;
+
+    const questionMatch = questionStart(trimmed);
+    // An alternative printed under `OR` often repeats the question number:
+    // `4. Define reflection ... OR 4. Define refraction ...`. It is the same
+    // question, not a second one, so its marks must not be counted twice.
+    if (questionMatch && inChoice && currentTop && questionMatch.number === currentTop.number) {
+      currentTop.choiceLines = currentTop.choiceLines ?? [];
+      if (questionMatch.rest) currentTop.choiceLines.push(questionMatch.rest);
+      continue;
+    }
     if (questionMatch) {
-      const number = Number(questionMatch[1]);
-      const rest = cleanInline(questionMatch[2] ?? '');
-      const existing = tops.find(top => top.number === number);
+      const { number, rest } = questionMatch;
+      if (inChoice && currentTop && number !== currentTop.number) inChoice = false;
+      const existing: Draft | undefined = tops.find(top => top.number === number);
       if (existing && existing.lines.length === 0 && existing.parts.length === 0) {
         currentTop = existing;
         currentPart = null;
         inChoice = false;
+        expected = number + 1;
         if (rest) startPartOrText(existing, rest);
         continue;
       }
@@ -373,6 +530,10 @@ export function parsePaper(rawText: string): Paper {
       if (rest) currentTop.choiceLines.push(rest);
       continue;
     }
+
+    // Inline sub-parts are recognised before option rows because both look like
+    // `(a) ... (b) ...`; splitPartRun only accepts a run with per-part marks.
+    if (currentTop && !inChoice && consumePartRun(currentTop, trimmed)) continue;
 
     // A row of options such as "(a) respiration (b) photosynthesis (c) ..." is
     // one objective question, not four sub-questions. The row itself is the
@@ -402,6 +563,7 @@ export function parsePaper(rawText: string): Paper {
   }
 
   function startPartOrText(parent: Draft, rest: string) {
+    if (consumePartRun(parent, rest)) return;
     const part = subpartLabel(rest, usesRoman, parent.parts);
     if (part) {
       startPart(parent, part.label, cleanInline(part.rest));
@@ -442,37 +604,65 @@ export function parsePaper(rawText: string): Paper {
 
   for (const draft of tops) {
     const built = finaliseDraft(draft, draft.sectionMarks, globalMarks);
+    const parentValue =
+      built.parentMarks?.max ?? draft.sectionMarks?.max ?? globalMarks?.max ?? null;
 
     if (built.parts.length) {
-      const parentTotal = built.parentMarks?.max ?? null;
-      if (parentTotal !== null && built.allPartsHaveMarks && Math.abs(built.explicitSum - parentTotal) > 0.001) {
+      const values = built.parts.map(part => part.marks?.max ?? null);
+      const allocated = parentValue !== null ? allocateMarks(parentValue, values) : null;
+      const partValues = allocated ?? values;
+
+      if (allocated) {
         warnings.push(
-          `${displayRef(draft.key)} prints ${parentTotal} marks but its sub-parts add up to ${built.explicitSum}. The printed sub-part marks were used.`
+          `${displayRef(draft.key)} prints ${parentValue} marks in total but no mark for each part, so its ${built.parts.length} parts were divided as ${partValues
+            .map(value => (value === null ? '?' : Number(value.toFixed(2))))
+            .join(' + ')}. Check your paper if that split is wrong.`
         );
       }
-      for (const part of built.parts) {
+
+      const parentTotal =
+        parentValue ??
+        (partValues.every((value): value is number => value !== null)
+          ? partValues.reduce((sum, value) => sum + value, 0)
+          : null);
+
+      if (built.parentMarks && built.allPartsHaveMarks && Math.abs(built.explicitSum - built.parentMarks.max) > 0.001) {
+        warnings.push(
+          `${displayRef(draft.key)} prints ${built.parentMarks.max} marks but its sub-parts add up to ${built.explicitSum}. The printed sub-part marks were used.`
+        );
+      }
+
+      for (const [index, part] of built.parts.entries()) {
         const key = part.draft.key;
-        const max = part.marks?.max ?? null;
+        const explicit = part.marks?.max ?? null;
+        const max = partValues[index] ?? null;
+        const allocatedHere = explicit === null && max !== null;
+        const text = part.text;
         pushQuestion({
           key,
           ref: displayRef(key),
           parentKey: parentKeyOf(key),
-          text: part.text,
+          text,
+          parentText: built.text || null,
+          parentMax: parentTotal,
           // An internal choice printed for the whole question also applies to
           // its sub-parts when they do not carry their own alternative.
           choiceText: part.choiceText ?? built.choiceText,
           max,
-          marksSource: max !== null ? 'explicit' : null,
-          marksEvidence: part.marks?.evidence ?? null,
+          marksSource:
+            max === null ? null : allocatedHere ? ('allocated' as MarksSource) : ('explicit' as MarksSource),
+          marksEvidence:
+            part.marks?.evidence ??
+            (allocatedHere ? `${parentValue} marks printed for ${displayRef(draft.key)}, divided across its parts` : null),
           section: draft.section,
-          kind: detectQuestionKind({ text: part.text, choiceText: part.choiceText, max }),
+          kind: detectQuestionKind({ text: `${built.text} ${text}`, choiceText: part.choiceText, max }),
           page: part.draft.page,
         });
       }
       continue;
     }
 
-    const text = built.text;
+    const text = stripBareOptionMark(built.text, built.parentMarks);
     if (text.length < 2) continue;
 
     const explicit = built.parentMarks;
@@ -523,15 +713,145 @@ export function parsePaper(rawText: string): Paper {
       `The printed maximum marks could not be found for ${unresolvedRefs.slice(0, 6).join(', ')}${unresolvedRefs.length > 6 ? '…' : ''}. Confirm these marks before marking.`
     );
   }
+
+  // A gap in the numbering is the clearest signal that a question was missed,
+  // which is exactly what a merged or badly OCR'd page produces.
+  const numbers = [...new Set(questions.map(question => Number(parentKeyOf(question.key))))]
+    .filter(value => Number.isFinite(value) && value > 0)
+    .sort((left, right) => left - right);
+  if (numbers.length && numbers[0] === 1) {
+    const highest = numbers[numbers.length - 1];
+    const missing: number[] = [];
+    for (let value = 1; value <= highest; value++) {
+      if (!numbers.includes(value)) missing.push(value);
+    }
+    if (missing.length) {
+      warnings.push(
+        `Question number${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} missing between Q1 and Q${highest}. Paperwise did not invent them — check that the upload shows every question before marking.`
+      );
+    }
+  }
+
+  const resolvedTotal = Math.round(questions.reduce((sum, question) => sum + (question.max ?? 0), 0) * 100) / 100;
+  const printedTotal = printedTotalFromText(rawText);
+  if (printedTotal !== null && questions.length && Math.abs(printedTotal - resolvedTotal) > 0.01) {
+    warnings.push(
+      resolvedTotal < printedTotal
+        ? `The paper states a total of ${printedTotal} marks, but only ${resolvedTotal} marks were found across its questions. Some questions or printed marks were not recognised; review the question chips before marking.`
+        : `The questions add up to ${resolvedTotal} marks, which is more than the ${printedTotal} marks printed on the paper. Check for a duplicated question or sub-part.`
+    );
+  }
+
   return {
     questions,
     sections: sections.map(({ key: _key, ...section }) => section),
     rules,
     warnings,
-    resolvedTotal: questions.reduce((sum, question) => sum + (question.max ?? 0), 0),
+    resolvedTotal,
+    printedTotal,
     unresolvedRefs,
     source: 'upload',
   };
+}
+
+function finaliseDraft(draft: Draft, sectionMarks: MarksInfo | null, globalMarks: MarksInfo | null) {
+  const choiceText = draft.choiceLines ? buildQuestionText(draft.choiceLines) || null : null;
+  const own = marksFromText(draft.lines);
+  const ownChoice = draft.choiceLines ? marksFromText(draft.choiceLines) : null;
+  const questionText = buildQuestionText(draft.lines);
+
+  if (draft.parts.length && partsLookLikeOptions(draft)) {
+    // The "sub-parts" are really answer options: fold them back into the
+    // question instead of grading four one-word options as four answers.
+    const options = draft.parts
+      .map(part => `(${part.label}) ${buildQuestionText(part.lines)}`)
+      .join(' ');
+    const marks = marksFromText([...draft.lines, ...draft.parts.flatMap(part => part.lines)]);
+    return {
+      text: cleanInline(`${questionText} ${options}`),
+      choiceText,
+      parentMarks: marks ?? own ?? ownChoice,
+      parts: [] as Array<{ draft: Draft; text: string; choiceText: string | null; marks: MarksInfo | null }>,
+      explicitSum: 0,
+      allPartsHaveMarks: false,
+      sectionMarks,
+      globalMarks,
+    };
+  }
+
+  if (draft.parts.length) {
+    const parts = draft.parts
+      .map(part => {
+        const partLines = [...part.lines, ...(part.choiceLines ?? [])];
+        const partMarks = marksFromText(part.lines) ?? marksFromText(partLines);
+        return {
+          draft: part,
+          text: buildQuestionText(part.lines),
+          choiceText: part.choiceLines ? buildQuestionText(part.choiceLines) || null : null,
+          marks: partMarks,
+        };
+      })
+      .filter(part => part.text.length >= 2);
+
+    const explicitSum = parts.reduce((sum, part) => sum + (part.marks?.max ?? 0), 0);
+    const allPartsHaveMarks = parts.length > 0 && parts.every(part => part.marks);
+
+    return {
+      text: questionText,
+      choiceText,
+      parentMarks: own ?? ownChoice,
+      parts,
+      explicitSum,
+      allPartsHaveMarks,
+      sectionMarks,
+      globalMarks,
+    };
+  }
+
+  return {
+    text: questionText,
+    choiceText,
+    parentMarks: own ?? ownChoice,
+    parts: [] as Array<{ draft: Draft; text: string; choiceText: string | null; marks: MarksInfo | null }>,
+    explicitSum: 0,
+    allPartsHaveMarks: false,
+    sectionMarks,
+    globalMarks,
+  };
+}
+
+/**
+ * Are these "parts" actually a multiple-choice option list? Options are short,
+ * unmarked, consecutive `(a)…(d)` lines under a question stem. Real sub-parts
+ * either carry marks or read as full instructions.
+ */
+function partsLookLikeOptions(draft: Draft): boolean {
+  const parts = draft.parts;
+  if (parts.length < 2 || parts.length > 6) return false;
+  const labels = parts.map(part => part.label.toLowerCase());
+  if (labels.some(label => isRoman(label))) return false;
+  // Options may be wrapped over two lines, so a run can start at (c), and one
+  // line can carry `(a) ... (b) ...` while the next carries `(c) ... (d) ...`.
+  const codes = labels.map(label => label.charCodeAt(0) - 97);
+  if (!codes.every((code, index) => index === 0 || code > codes[index - 1])) return false;
+  const inlineMarkers = parts.some(part => /\([a-h]\)/i.test(buildQuestionText(part.lines)));
+  if (parts.some(part => marksFromText(part.lines) !== null)) return false;
+  if (parts.some(part => part.choiceLines)) return false;
+  const short = parts.every(part => buildQuestionText(part.lines).length <= 90);
+  if (!short) return false;
+  const stem = buildQuestionText(draft.lines);
+  const asksQuestion = /\?\s*$/.test(stem) || MCQs.test(stem);
+  const oneMark = marksFromText(draft.lines)?.max === 1;
+  return (asksQuestion && (codes[0] === 0 || inlineMarkers)) || (labels.length === 4 && codes[0] === 0 && oneMark);
+}
+
+function printedTotalFromText(rawText: string): number | null {
+  const match =
+    rawText.match(/(?:maximum|max\.?|total)\s*marks?\s*[:\-–—]?\s*(\d{1,4})/i) ??
+    rawText.match(/पूर्णांक\s*[:\-–—]?\s*(\d{1,4})/);
+  if (!match) return null;
+  const value = Number(match[1]);
+  return Number.isFinite(value) && value > 0 && value <= 1000 ? value : null;
 }
 
 /** Build a paper from manually typed questions. */
@@ -566,7 +886,8 @@ export function paperFromManual(
     sections: [],
     rules: boardLabel ? [`Board/curriculum: ${boardLabel}`] : [],
     warnings: unresolvedRefs.length ? ['Some manually entered questions have no valid maximum marks.'] : [],
-    resolvedTotal: questions.reduce((sum, question) => sum + (question.max ?? 0), 0),
+    resolvedTotal: Math.round(questions.reduce((sum, question) => sum + (question.max ?? 0), 0) * 100) / 100,
+    printedTotal: null,
     unresolvedRefs,
     source: 'manual',
   };
@@ -590,7 +911,7 @@ export function withMarksOverrides(paper: Paper, overrides: Record<string, numbe
   return {
     ...paper,
     questions,
-    resolvedTotal: questions.reduce((sum, question) => sum + (question.max ?? 0), 0),
+    resolvedTotal: Math.round(questions.reduce((sum, question) => sum + (question.max ?? 0), 0) * 100) / 100,
     unresolvedRefs: questions.filter(question => question.max === null).map(question => question.ref),
   };
 }

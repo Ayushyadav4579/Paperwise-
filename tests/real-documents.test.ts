@@ -23,6 +23,7 @@ import { segmentAnswers } from '../src/exam/answers';
 
 const RUN = process.env.PAPERWISE_REAL_DOCS === '1';
 const FIXTURES = 'tests/fixtures/real';
+const PHYSICS = 'tests/fixtures/physics';
 const needed = [
   'question-paper-digital.pdf',
   'question-paper-scan.pdf',
@@ -30,8 +31,10 @@ const needed = [
   'answer-sheet-handwritten.jpg',
   'answer-sheet-hindi.png',
   'question-paper-hard.png',
+  `${PHYSICS}/physics-paper-scan.pdf`,
+  `${PHYSICS}/physics-paper-scan-page1.jpg`,
 ];
-const available = needed.every(file => existsSync(`${FIXTURES}/${file}`));
+const available = needed.every(file => existsSync(file.startsWith('tests/') ? file : `${FIXTURES}/${file}`));
 const suite = RUN && available ? describe : describe.skip;
 
 const summary: Array<{ file: string; chars: number; quality: string; questions: number; detail: string }> = [];
@@ -180,6 +183,22 @@ suite('real documents: OCR', () => {
     // is reported as only partly read.
     expect(assessTextQuality(text)).toBe('good');
   });
+
+  it('OCRs a scanned physics paper and recovers the merged question numbering', async () => {
+    // The scan has no text layer, so every character below is OCR output from
+    // the same tesseract pipeline the browser uses.
+    expect(await textLayerLength(`${PHYSICS}/physics-paper-scan.pdf`)).toBe(0);
+    const text = await ocr(await readFile(`${PHYSICS}/physics-paper-scan-page1.jpg`), 'eng');
+    const paper = parsePaper(text);
+    record('physics-paper-scan.pdf', text, paper.questions.length, `total ${paper.resolvedTotal} · ${paper.questions.map(q => q.ref).join(',')}`);
+    console.log('[physics scan ocr]\n' + text.slice(0, 1200));
+    expect(text).toMatch(/vector quantity/i);
+    expect(text).toMatch(/velocity-time/i);
+    // Page 1 holds Q1–Q5 (9 marks). It must not collapse into one question.
+    expect(paper.questions.length).toBeGreaterThanOrEqual(4);
+    expect(paper.questions.some(question => question.ref === 'Q1')).toBe(true);
+    expect(paper.questions.some(question => question.text.includes('vector quantity'))).toBe(true);
+  }, 180_000);
 
   it('recovers a faint page with the adaptive-threshold second pass', async () => {
     const buffer = await readFile(`${FIXTURES}/question-paper-hard.png`);

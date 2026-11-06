@@ -8,6 +8,8 @@ __pycache__/
 *.log
 node_modules/
 dist/
+# Temporary copy of the built site used by the deployment builder.
+isolate/
 *.tsbuildinfo
 # Tesseract language data is downloaded on demand by the OCR tests.
 *.traineddata

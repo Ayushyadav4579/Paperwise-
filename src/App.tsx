@@ -5,6 +5,7 @@ import {
   Image,
   CheckCircle2,
   AlertCircle,
+  AlertTriangle,
   Sparkles,
   ClipboardCheck,
   X,
@@ -563,8 +564,20 @@ function App() {
               <div className="paper-summary">
                 <div className="paper-summary-head">
                   <strong>{paperSummaryLabel(parsedPaper)}</strong>
-                  <span>{parsedPaper.resolvedTotal} marks found</span>
+                  <span>
+                    {parsedPaper.printedTotal !== null
+                      ? `${parsedPaper.resolvedTotal} of ${parsedPaper.printedTotal} marks found`
+                      : `${parsedPaper.resolvedTotal} marks found`}
+                  </span>
                 </div>
+                {parsedPaper.printedTotal !== null &&
+                  Math.abs(parsedPaper.printedTotal - parsedPaper.resolvedTotal) > 0.01 && (
+                    <p className="paper-mismatch" role="alert">
+                      <AlertTriangle size={14} /> The paper prints {parsedPaper.printedTotal} marks, but{" "}
+                      {parsedPaper.resolvedTotal} were recognised. Check the question chips below — a question or its printed
+                      mark may not have been read. Paperwise will not invent the missing marks.
+                    </p>
+                  )}
                 <div className="ref-chips">
                   {parsedPaper.questions.slice(0, 32).map(question => (
                     <span key={question.key} className={question.max === null ? 'ref-chip missing-mark' : 'ref-chip'}>

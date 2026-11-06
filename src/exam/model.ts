@@ -10,7 +10,7 @@ export type QuestionKind =
   | 'diagram'
   | 'language';
 
-export type MarksSource = 'explicit' | 'section' | 'instruction' | 'ai' | 'manual';
+export type MarksSource = 'explicit' | 'section' | 'instruction' | 'allocated' | 'ai' | 'manual';
 
 export type PaperSection = {
   name: string;
@@ -27,6 +27,10 @@ export type PaperQuestion = {
   /** Parent question key (`1` for `1A`), or its own key. */
   parentKey: string;
   text: string;
+  /** Shared stem of a multi-part question, for grading a part in context. */
+  parentText?: string | null;
+  /** Total printed for the whole multi-part question, when known. */
+  parentMax?: number | null;
   /** Alternative question text when the paper offers an internal choice. */
   choiceText: string | null;
   max: number | null;
@@ -47,6 +51,8 @@ export type Paper = {
   warnings: string[];
   /** Sum of every resolved question maximum. */
   resolvedTotal: number;
+  /** Total printed in the paper header, e.g. "Maximum Marks: 25". */
+  printedTotal: number | null;
   /** Refs whose maximum could not be proven from the uploaded paper. */
   unresolvedRefs: string[];
   source: 'upload' | 'manual';
@@ -103,6 +109,7 @@ export function emptyPaper(source: Paper['source'] = 'upload'): Paper {
     rules: [],
     warnings: [],
     resolvedTotal: 0,
+    printedTotal: null,
     unresolvedRefs: [],
     source,
   };

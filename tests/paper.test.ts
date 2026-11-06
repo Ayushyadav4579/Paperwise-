@@ -168,12 +168,24 @@ describe('structure edge cases', () => {
     expect(paper.questions.every(question => question.max === 1)).toBe(true);
   });
 
-  it('warns instead of inventing marks when only a parent total is printed', () => {
+  it('divides a parent total across its parts when no part marks are printed', () => {
     const paper = parsePaper(`1. Answer the following. [5]
 (a) Define A.
 (b) Define B.`);
+    expect(paper.questions.map(question => question.max)).toEqual([2.5, 2.5]);
+    expect(paper.questions.every(question => question.marksSource === 'allocated')).toBe(true);
+    // The split is a stated inference, never a silent one, and it preserves
+    // the printed total instead of shrinking the denominator.
+    expect(paper.resolvedTotal).toBe(5);
+    expect(paper.warnings.join(' ')).toMatch(/prints 5 marks in total but no mark for each part/i);
+  });
+
+  it('keeps sub-part marks unresolved when neither the parts nor the parent print marks', () => {
+    const paper = parsePaper(`1. Answer the following.
+(a) Define A.
+(b) Define B.`);
     expect(paper.questions.map(question => question.max)).toEqual([null, null]);
-    expect(paper.warnings.join(' ')).toMatch(/could not be found/i);
+    expect(paper.unresolvedRefs).toEqual(['Q1(a)', 'Q1(b)']);
   });
 });
 
