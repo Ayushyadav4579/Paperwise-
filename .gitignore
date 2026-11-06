@@ -9,3 +9,5 @@ __pycache__/
 node_modules/
 dist/
 *.tsbuildinfo
+# Tesseract language data is downloaded on demand by the OCR tests.
+*.traineddata

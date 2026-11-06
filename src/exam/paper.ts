@@ -72,7 +72,11 @@ function lastMatch(text: string, pattern: RegExp): RegExpMatchArray | null {
 }
 
 function marksFromText(lines: string[]): MarksInfo | null {
-  const text = cleanInline(lines.join(' '));
+  // An MCQ's option row comes after the printed mark, e.g.
+  // "1. Which ...? (1)" followed by "(a) coal (b) gas ...". Reading the whole
+  // block put the option row last, so the trailing-mark rule missed Q1.
+  const stem = lines.filter(line => !looksLikeOptionRow(line));
+  const text = cleanInline(stem.join(' '));
   if (!text) return null;
 
   const distribution = text.match(TRAILING_DISTRIBUTION_RE);

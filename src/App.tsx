@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import {
   Upload,
   FileText,
@@ -13,9 +13,16 @@ import {
   ShieldCheck,
   SlidersHorizontal,
   Loader2,
+  RefreshCw,
+  Wifi,
 } from 'lucide-react';
 import { extractDocument } from './fileText';
-import { MAX_QUESTIONS_PER_RUN, MarksUnresolvedError, evaluatePaper } from './exam/grade';
+import {
+  MAX_QUESTIONS_PER_RUN,
+  MarksUnresolvedError,
+  evaluatePaper,
+  retryUnresolvedQuestions,
+} from './exam/grade';
 import { paperFromManual, parsePaper, withMarksOverrides } from './exam/paper';
 import type { EvaluationReport, Paper, QuestionGrade } from './exam/model';
 import { createPuterChat } from './ai/provider';
@@ -69,7 +76,36 @@ function App() {
   const [status, setStatus] = useState('');
   const [error, setError] = useState('');
   const [busy, setBusy] = useState(false);
+  const [elapsed, setElapsed] = useState(0);
+  const [aiCheck, setAiCheck] = useState<{ state: 'idle' | 'checking' | 'ok' | 'error'; message: string }>({
+    state: 'idle',
+    message: '',
+  });
   const abortRef = useRef<AbortController | null>(null);
+  // `busy` only updates after a render, so a double click could start two
+  // expensive runs. This ref blocks the second one synchronously.
+  const inFlightRef = useRef(false);
+
+  useEffect(() => {
+    if (!busy) {
+      setElapsed(0);
+      return;
+    }
+    const started = Date.now();
+    const timer = setInterval(() => setElapsed(Math.floor((Date.now() - started) / 1000)), 1000);
+    return () => clearInterval(timer);
+  }, [busy]);
+
+  function elapsedLabel(seconds: number): string {
+    const minutes = Math.floor(seconds / 60);
+    return minutes ? `${minutes}m ${seconds % 60}s` : `${seconds}s`;
+  }
+
+  function answersForMarking(usingUpload: boolean): string {
+    return usingUpload
+      ? answerSheetText
+      : filledManual.map((question, index) => `${index + 1}. ${question.answer}`).join('\n\n');
+  }
 
   const questionPaperText = useMemo(
     () => questionFiles.map(file => file.extractedText).filter(Boolean).join('\n\n'),
@@ -187,8 +223,66 @@ function App() {
     setStatus('');
   }
 
+  async function checkAiConnection() {
+    if (aiCheck.state === 'checking') return;
+    setAiCheck({ state: 'checking', message: 'Contacting the marking model with a one-line test…' });
+    const started = performance.now();
+    try {
+      const chat = createPuterChat({ retries: 0 });
+      const result = await chat(
+        [
+          { role: 'system', content: 'You are a connection test. Reply with JSON only.' },
+          { role: 'user', content: 'Reply with exactly {"ok": true} and nothing else.' },
+        ],
+        { maxTokens: 24, temperature: 0, timeoutMs: 30_000 }
+      );
+      const seconds = ((performance.now() - started) / 1000).toFixed(1);
+      if (/ok/i.test(result.text)) {
+        setAiCheck({ state: 'ok', message: `Connected to ${result.model} in ${seconds}s.` });
+      } else {
+        setAiCheck({
+          state: 'error',
+          message: `The AI answered but not as expected: “${result.text.slice(0, 80)}”.`,
+        });
+      }
+    } catch (issue) {
+      setAiCheck({ state: 'error', message: friendlyAiMessage(issue) });
+    }
+  }
+
+  async function retryFailed() {
+    if (!report || inFlightRef.current || extracting) return;
+    const controller = new AbortController();
+    abortRef.current = controller;
+    inFlightRef.current = true;
+    setBusy(true);
+    setError('');
+    setStatus('Re-marking the answers that could not be verified…');
+    try {
+      const usingUpload = questionPaperText.trim().length > 0;
+      const next = await retryUnresolvedQuestions({
+        report,
+        answerText: answersForMarking(usingUpload),
+        board,
+        grade,
+        chat: createPuterChat(),
+        paperText: usingUpload ? questionPaperText : undefined,
+        onProgress: setStatus,
+        signal: controller.signal,
+      });
+      setReport(next);
+    } catch (issue) {
+      setError(friendlyAiMessage(issue));
+    } finally {
+      abortRef.current = null;
+      inFlightRef.current = false;
+      setBusy(false);
+      setStatus('');
+    }
+  }
+
   async function evaluate() {
-    if (busy || extracting) return;
+    if (inFlightRef.current || extracting) return;
     setError('');
     setReport(null);
 
@@ -231,16 +325,16 @@ function App() {
       return;
     }
 
-    const manualAnswers = filledManual.map((question, index) => `${index + 1}. ${question.answer}`).join('\n\n');
     const controller = new AbortController();
     abortRef.current = controller;
+    inFlightRef.current = true;
     setBusy(true);
     setStatus('Starting automatic marking…');
     try {
       const result = await evaluatePaper({
         paper,
         paperText: usingUpload ? questionPaperText : undefined,
-        answerText: usingUpload ? answerSheetText : manualAnswers,
+        answerText: answersForMarking(usingUpload),
         board,
         grade,
         chat: createPuterChat(),
@@ -267,6 +361,7 @@ function App() {
       }
     } finally {
       abortRef.current = null;
+      inFlightRef.current = false;
       setBusy(false);
       setStatus('');
     }
@@ -298,7 +393,7 @@ function App() {
           <span>
             Private by design
             <br />
-            <small>Pages are read on your device. Only extracted text is sent for marking.</small>
+            <small>Pages are read on your device. Only extracted text is sent to the AI for marking.</small>
           </span>
         </div>
       </aside>
@@ -404,7 +499,7 @@ function App() {
                 id="question-paper-files"
                 type="file"
                 multiple
-                accept="image/*,.pdf,.txt,.md"
+                accept="image/*,.heic,.heif,.pdf,.txt,.md"
                 onChange={event => {
                   void addFiles(event.target.files, 'question');
                   event.target.value = '';
@@ -416,7 +511,7 @@ function App() {
                 </div>
                 <strong>Choose question paper files</strong>
                 <span>Photos, scanned pages, PDFs, or text files</span>
-                <small>JPG · PNG · PDF · TXT</small>
+                <small>JPG · PNG · HEIC · PDF</small>
               </label>
             </div>
 
@@ -521,7 +616,7 @@ function App() {
                 id="answer-sheet-files"
                 type="file"
                 multiple
-                accept="image/*,.pdf,.txt,.md"
+                accept="image/*,.heic,.heif,.pdf,.txt,.md"
                 onChange={event => {
                   void addFiles(event.target.files, 'answer');
                   event.target.value = '';
@@ -533,7 +628,7 @@ function App() {
                 </div>
                 <strong>Choose answer sheet files</strong>
                 <span>Photos, scanned pages, PDFs, or text files</span>
-                <small>JPG · PNG · PDF · TXT</small>
+                <small>JPG · PNG · HEIC · PDF</small>
               </label>
             </div>
             {answerFiles.length > 0 && (
@@ -666,12 +761,31 @@ function App() {
               </div>
             </div>
 
+            <div className={`model-notice ai-check ${aiCheck.state === 'ok' ? 'ok' : aiCheck.state === 'error' ? 'failed' : ''}`}>
+              <Wifi size={18} />
+              <div>
+                <strong>AI connection</strong>
+                <p>
+                  {aiCheck.state === 'idle'
+                    ? 'Marking needs a one-time free Puter sign-in. Test the real model before a long paper.'
+                    : aiCheck.message}
+                </p>
+                <button onClick={() => void checkAiConnection()} disabled={aiCheck.state === 'checking'}>
+                  {aiCheck.state === 'checking' ? 'Checking…' : 'Check AI connection'}
+                </button>
+              </div>
+            </div>
+
             {status && (
               <div className="model-notice" role="status">
                 <Sparkles size={18} />
                 <div>
                   <strong>Working</strong>
                   <p>{status}</p>
+                  <p className="elapsed">
+                    {elapsedLabel(elapsed)} · Large papers are marked in batches, so this can take a few minutes. Stopping keeps
+                    nothing.
+                  </p>
                   <button onClick={() => abortRef.current?.abort()}>Stop</button>
                 </div>
               </div>
@@ -689,6 +803,25 @@ function App() {
               {busy ? 'Marking your paper…' : extracting ? 'Reading your files…' : 'Run automatic marking'}{' '}
               {!busy && !extracting && <ArrowRight size={18} />}
             </button>
+
+            <details className="report-notes privacy-note">
+              <summary>
+                <ShieldCheck size={14} /> How your papers are handled
+              </summary>
+              <ul>
+                <li>
+                  Files are opened, read and OCR'd in your browser. Paperwise has no server that receives or stores your
+                  uploads.
+                </li>
+                <li>
+                  When you run marking, the extracted question and answer text is sent to Puter.js, which passes it to a
+                  DeepSeek model. That is a third-party AI service outside Paperwise. Do not upload someone else's paper
+                  without their permission.
+                </li>
+                <li>Nothing is saved to an account, and the extracted text is discarded when you close or refresh the tab.</li>
+                <li>Marks are estimates. Check them before using them for anything official.</li>
+              </ul>
+            </details>
           </section>
 
           <aside className="results-column">
@@ -714,10 +847,16 @@ function App() {
                     {report.unresolvedCount ? ` · ${report.unresolvedCount} need review` : ''}
                   </small>
                   {!report.complete && (
-                    <p className="provisional">
-                      Partial result: {report.unresolvedCount} answer{report.unresolvedCount === 1 ? '' : 's'} could not be
-                      verified and {report.unresolvedCount === 1 ? 'is' : 'are'} not counted in the total.
-                    </p>
+                    <>
+                      <p className="provisional">
+                        Partial result: {report.unresolvedCount} answer{report.unresolvedCount === 1 ? '' : 's'} could not be
+                        verified and {report.unresolvedCount === 1 ? 'is' : 'are'} not counted in the total.
+                      </p>
+                      <button className="secondary-button retry-button" onClick={() => void retryFailed()} disabled={busy}>
+                        <RefreshCw size={15} /> Re-mark the {report.unresolvedCount} unfinished answer
+                        {report.unresolvedCount === 1 ? '' : 's'}
+                      </button>
+                    </>
                   )}
                 </div>
 

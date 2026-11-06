@@ -48,7 +48,15 @@ declare global {
 }
 
 export const PROVIDER_LABEL = 'Puter.js';
-export const DEFAULT_MODELS = ['deepseek/deepseek-v4.1-flash', 'deepseek/deepseek-v4-flash'];
+// Checked against Puter's live model catalogue (api.puter.com/puterai/chat/models)
+// on 2026-11-06. It lists provider-prefixed routes such as
+// openrouter:deepseek/deepseek-v4.1-flash alongside the bare id used in the
+// documentation, so the fallbacks are those concrete routes.
+export const DEFAULT_MODELS = [
+  'deepseek/deepseek-v4.1-flash',
+  'openrouter:deepseek/deepseek-v4.1-flash',
+  'infron:deepseek/deepseek-v4.1-flash',
+];
 export const PRIMARY_MODEL = DEFAULT_MODELS[0];
 
 const DEFAULT_TIMEOUT_MS = 150_000;

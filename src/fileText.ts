@@ -1,6 +1,8 @@
 import { getDocument, GlobalWorkerOptions } from 'pdfjs-dist';
 import pdfWorker from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 import { createWorker, type Worker as OcrWorker } from 'tesseract.js';
+import { binarisePixels, needsSecondPass } from './extraction/enhance';
+import { isHeicFile, normaliseImageFile } from './heic';
 import {
   MAX_PDF_PAGES,
   MAX_TEXT_CHARS,
@@ -64,6 +66,56 @@ function createOcrHandle(onStatus: Status, state: { hindiFailed: boolean }): () 
 
 function canUseDom(): boolean {
   return typeof document !== 'undefined' && typeof window !== 'undefined';
+}
+
+function qualityRank(quality: TextQuality): number {
+  return quality === 'good' ? 3 : quality === 'partial' ? 2 : 1;
+}
+
+/**
+ * Copy a page and locally threshold it. Used only when the first OCR pass
+ * failed, because it costs another full recognition and ~30 MB of pixels.
+ */
+function binarisedCopy(canvas: HTMLCanvasElement): HTMLCanvasElement {
+  const copy = document.createElement('canvas');
+  copy.width = canvas.width;
+  copy.height = canvas.height;
+  const context = copy.getContext('2d', { willReadFrequently: true });
+  if (!context) throw new Error('This browser could not prepare the page for OCR.');
+  context.drawImage(canvas, 0, 0);
+  const image = context.getImageData(0, 0, copy.width, copy.height);
+  binarisePixels(image);
+  context.putImageData(image, 0, 0);
+  return copy;
+}
+
+/** OCR a page, retrying a faint or noisy one with adaptive thresholding. */
+async function recognisePage(worker: OcrWorker, canvas: HTMLCanvasElement): Promise<string> {
+  const first = normaliseExtractedText((await worker.recognize(canvas)).data.text || '');
+  let best = first;
+  let bestQuality = assessTextQuality(first);
+  if (!needsSecondPass(bestQuality, first.replace(/\s+/g, '').length)) return best;
+  let cleaned: HTMLCanvasElement | null = null;
+  try {
+    cleaned = binarisedCopy(canvas);
+    const second = normaliseExtractedText((await worker.recognize(cleaned)).data.text || '');
+    const secondQuality = assessTextQuality(second);
+    const better =
+      qualityRank(secondQuality) > qualityRank(bestQuality) ||
+      (secondQuality === bestQuality && second.length > best.length * 1.1);
+    if (second.trim() && better) {
+      best = second;
+      bestQuality = secondQuality;
+    }
+  } catch {
+    // Enhancement is a rescue attempt; the first pass is still usable output.
+  } finally {
+    if (cleaned) {
+      cleaned.width = 0;
+      cleaned.height = 0;
+    }
+  }
+  return best;
 }
 
 async function renderPageForOcr(page: {
@@ -182,8 +234,7 @@ async function extractPdf(
           ocr = handle;
           const canvas = await renderPageForOcr(page as unknown as Parameters<typeof renderPageForOcr>[0]);
           try {
-            const result = await handle.worker.recognize(canvas);
-            const ocrText = normaliseExtractedText(result.data.text || '');
+            const ocrText = await recognisePage(handle.worker, canvas);
             const ocrQuality = assessTextQuality(ocrText);
             if (ocrText && (ocrQuality !== 'poor' || quality === 'poor')) {
               // Prefer OCR when it clearly reads more of the page.
@@ -253,8 +304,7 @@ async function extractImage(
   const ocr = await getOcr();
   const canvas = await loadImageForOcr(file);
   try {
-    const result = await ocr.worker.recognize(canvas);
-    const text = normaliseExtractedText(result.data.text || '').slice(0, MAX_TEXT_CHARS);
+    const text = (await recognisePage(ocr.worker, canvas)).slice(0, MAX_TEXT_CHARS);
     const quality = assessTextQuality(text);
     if (!text.trim()) {
       warnings.push(`No readable text was found in ${file.name}. Upload a sharper, well-lit photo.`);
@@ -301,7 +351,8 @@ export async function extractDocument(file: File, onStatus: Status): Promise<Ext
   if (file.type === 'application/pdf' || /\.pdf$/i.test(name)) {
     pages = (await extractPdf(file, onStatus, warnings, state)).pages;
   } else {
-    pages = await extractImage(file, onStatus, warnings, state);
+    if (isHeicFile(file)) onStatus(`Converting ${file.name} from HEIC to JPEG…`);
+    pages = await extractImage(await normaliseImageFile(file), onStatus, warnings, state);
   }
 
   if (!pages.some(page => page.text.trim())) {

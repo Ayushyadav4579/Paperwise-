@@ -9,8 +9,10 @@ It is designed to fail safely: a mark is never invented, and a model reply that 
 1. **Extraction** (`src/fileText.ts`, `src/extraction/layout.ts`)
    - Text-based PDFs are rebuilt into real lines from glyph coordinates, so question numbering and paragraphs survive.
    - Pages are marked (`--- Page N ---`) and scanned pages fall back to offline Tesseract OCR in English and Hindi.
+   - A page whose first OCR pass is unusable is OCR'd again after adaptive local thresholding. On the faint-pencil test page this changed garbled output into every printed line.
+   - iPhone HEIC/HEIF photos are converted to JPEG in the browser before OCR; a conversion failure is reported, never silently skipped.
    - Every page is quality-checked. Unreadable or partly readable pages are reported by page number.
-   - Limits: 25 MB per file, 60 PDF pages per file, 240k characters.
+   - Limits: 50 MB per file, 120 PDF pages per file, 600k characters, 300 questions per run.
 
 2. **Paper parsing** (`src/exam/paper.ts`)
    - Detects questions, sub-parts (`(a)`, `(i)`), sections, instructions and internal choices (`OR`).
@@ -27,10 +29,13 @@ It is designed to fail safely: a mark is never invented, and a model reply that 
    - The model must return a JSON score, reason, correct points, missing points, mistakes and confidence.
    - Out-of-range, non-numeric, unexplained or missing results are rejected. A failed batch is split; a failed single question is marked "needs review", never zero.
    - Unanswered questions are recorded as unattempted and stay in the paper total, so `awarded ≤ sum of question maxima` always holds.
+   - Large papers are marked in batches of four with lower concurrency. "Re-mark the unfinished answers" retries only the questions that failed, reusing the verified marks.
 
 ## Runtime AI provider
 
-The default (and only) browser grading path is **Puter.js → `deepseek/deepseek-v4.1-flash`**, with `deepseek/deepseek-v4-flash` as a fallback. No API key or paid OpenAI/Gemini account is required; the signed-in user's Puter account covers the request. If Puter cannot load, Paperwise reports that clearly and produces no scores.
+The default (and only) browser grading path is **Puter.js → `deepseek/deepseek-v4.1-flash`**, falling back to the provider-prefixed routes `openrouter:deepseek/deepseek-v4.1-flash` and `infron:deepseek/deepseek-v4.1-flash` from Puter's live model catalogue. No API key or paid OpenAI/Gemini account is required; the signed-in user's Puter account covers the request. If Puter cannot load, Paperwise reports that clearly and produces no scores.
+
+The **Check AI connection** button in the app sends one tiny real request through this same code path and reports the model that answered and the latency. Puter requires a signed-in browser session (an unauthenticated API request is rejected with `401 token_missing`), so this check is the authoritative sign that grading can run.
 
 `server/` contains an optional, separate FastAPI grading API using an open-weight Qwen model. It is **not deployed or verified** by this repository and is not used by the dashboard. It remains available for self-hosting experiments.
 
@@ -40,8 +45,32 @@ The default (and only) browser grading path is **Puter.js → `deepseek/deepseek
 bun install
 bun run dev      # Vite preview
 bun tsc -b --noEmit
-bun test         # Vitest: parsing, matching, grading, validation, provider failures
+bun test         # 112 unit/contract tests: parsing, matching, grading, validation, provider failures
 ```
+
+### Real-document tests
+
+`tests/real-documents.test.ts` runs the production extraction code over actual PDF, JPEG and PNG files in `tests/fixtures/real`. It is opt-in because it downloads Tesseract language data:
+
+```bash
+PAPERWISE_REAL_DOCS=1 bunx vitest run tests/real-documents.test.ts
+bun run scripts/make-fixtures.ts   # rebuild the fixtures (needs the fonts in scripts/make-fixtures.ts)
+```
+
+It covers a digital PDF with a text layer, an image-only scanned PDF, a rotated/noisy photo, a handwritten-style ruled answer sheet, a Hindi page and a faint-pencil page with a table, equation and diagram. These are generated documents, not photographs of real student scripts.
+
+## Privacy and data flow
+
+- Uploads are opened, rendered and OCR'd inside the browser. There is no Paperwise server in the production build, so files are not uploaded to or stored by Paperwise.
+- Marking sends the extracted question text and answer text to [Puter.js](https://docs.puter.com/AI/chat/), which forwards it to the selected DeepSeek model. That is a third-party service governed by its own terms.
+- No account, database, analytics or cookie stores the papers. Extracted text lives in page memory and is discarded on refresh.
+- Do not upload someone else's paper without permission, and do not treat AI marks as an official result.
+
+## Deployment
+
+The production artifact is a static Vite build (`bun run build` → `dist/`). Any free static host works; the repository is configured for Freebuff managed hosting. There is no API route, database, CORS or server timeout to configure, because grading happens in the browser against Puter. HTTPS is provided by the host. `server/` is not part of the deployed app.
+
+On a phone, use the camera/photo picker; HEIC photos from iPhones are converted in the browser. The layout is responsive down to 390 px.
 
 ## Python API (optional experiment)
 
@@ -57,11 +86,13 @@ First start downloads model weights. See `docs/API.md`. Do not expose an unauthe
 
 ## Known limitations
 
-- Handwritten OCR is imperfect, especially for Hindi, diagrams, equations and faint pencil. The app reports unreadable pages instead of pretending they were read.
+- Handwritten OCR is imperfect: tesseract confuses `l`, `i` and `t` in cursive handwriting, and faint pencil needs the second pass. Unreadable pages are reported instead of pretending they were read.
+- Diagrams are not interpreted visually. A question that only refers to a drawn diagram is judged on the text the student wrote.
+- Equations are read as plain text; complex notation and tables may lose structure even when the surrounding sentence is read correctly.
 - Printed marks are inferred from the paper's text. Unusual layouts may need the student to confirm a maximum.
 - AI marking is an assistant, not a certified examiner. Scores should be reviewed against a teacher's marking scheme.
-- Long papers are capped at 60 questions per run; 60+ page PDFs must be split.
-- Puter's free allowance and rate limits are outside Paperwise's control.
+- A run is capped at 300 questions and 120 pages per file; beyond that, split the paper. This is a run-time/provider budget, not a grading limitation.
+- Puter's free allowance, rate limits and model availability are outside Paperwise's control.
 - Do not commit API keys, student names, or exam papers containing personal information.
 
 ## Repository extras

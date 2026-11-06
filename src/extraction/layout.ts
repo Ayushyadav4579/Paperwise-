@@ -109,9 +109,12 @@ export function normaliseExtractedText(text: string): string {
 export function assessTextQuality(text: string): TextQuality {
   const compact = text.replace(/\s+/g, '');
   if (compact.length < 8) return 'poor';
-  const alphanumeric = (text.match(/[\p{L}\p{N}]/gu) || []).length;
+  // Devanagari vowel signs and other combining marks are \p{M}, not \p{L}.
+  // Excluding them scored a perfectly read Hindi page as "partial" and would
+  // have pushed clean Hindi scans through the OCR second pass needlessly.
+  const alphanumeric = (text.match(/[\p{L}\p{N}\p{M}]/gu) || []).length;
   const readable = alphanumeric / compact.length;
-  const words = text.split(/\s+/).filter(word => /[\p{L}\p{N}]{2,}/u.test(word)).length;
+  const words = text.split(/\s+/).filter(word => /[\p{L}\p{N}\p{M}][\p{L}\p{N}\p{M}]{1,}/u.test(word)).length;
   if (compact.length >= 40 && readable >= 0.72 && words >= 8) return 'good';
   if (compact.length >= 24 && readable >= 0.5 && words >= 4) return 'partial';
   return 'poor';
@@ -150,17 +153,22 @@ export function pageNumberFromMarker(line: string): number | null {
   return match ? Number(match[1]) : null;
 }
 
-export const MAX_FILE_BYTES = 25 * 1024 * 1024;
-export const MAX_PDF_PAGES = 60;
-export const MAX_TEXT_CHARS = 240_000;
+// Pages are read one at a time and their canvases released before the next
+// page, so the limit is driven by time rather than memory. 120 pages is about
+// a full board paper plus its answer booklet, and 600k characters covers that
+// at roughly 2,500 characters a page.
+export const MAX_FILE_BYTES = 50 * 1024 * 1024;
+export const MAX_PDF_PAGES = 120;
+export const MAX_TEXT_CHARS = 600_000;
 
-export const ACCEPTED_EXTENSIONS = /\.(pdf|png|jpe?g|webp|gif|bmp|tiff?|txt|md|csv)$/i;
+export const ACCEPTED_EXTENSIONS = /\.(pdf|png|jpe?g|webp|gif|bmp|tiff?|heic|heif|txt|md|csv)$/i;
 
 /** Validate an upload before any expensive work starts. Returns a message or null. */
 export function validateUpload(file: File): string | null {
   const name = file.name || 'file';
   const isPdf = file.type === 'application/pdf' || /\.pdf$/i.test(name);
-  const isImage = file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|tiff?)$/i.test(name);
+  const isImage =
+    file.type.startsWith('image/') || /\.(png|jpe?g|webp|gif|bmp|tiff?|heic|heif)$/i.test(name);
   const isText = file.type.startsWith('text/') || /\.(txt|md|csv)$/i.test(name);
   if (!isPdf && !isImage && !isText) {
     return `${name} is not a supported file. Use a PDF, photo, or text file.`;

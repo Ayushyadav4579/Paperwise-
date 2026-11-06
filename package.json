@@ -7,7 +7,9 @@
     "dev": "vite",
     "build": "vite build",
     "preview": "vite preview",
-    "test": "vitest run"
+    "test": "vitest run",
+    "test:real": "PAPERWISE_REAL_DOCS=1 vitest run tests/real-documents.test.ts",
+    "fixtures": "bun run scripts/make-fixtures.ts"
   },
   "dependencies": {
     "@huggingface/transformers": "^3.8.1",
@@ -21,10 +23,12 @@
     "@rollup/rollup-linux-x64-gnu": "^4.0.0"
   },
   "devDependencies": {
+    "@napi-rs/canvas": "^1.1.0",
     "@types/react": "^19.0.0",
     "@types/react-dom": "^19.0.0",
     "@vitejs/plugin-react": "^4.3.0",
     "autoprefixer": "^10.4.0",
+    "pdf-lib": "^1.17.1",
     "postcss": "^8.4.0",
     "tailwindcss": "^3.4.0",
     "typescript": "^5.7.0",

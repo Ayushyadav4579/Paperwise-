@@ -15,7 +15,13 @@ import {
 } from './prompt';
 import { containsVerbatim, normaliseForMatch, refKey } from './text';
 
-export const MAX_QUESTIONS_PER_RUN = 60;
+// A paper is marked in batches of four with three in flight, so the old 60
+// question ceiling was far below what the provider and the browser can handle.
+// 300 questions is 75 batched requests and roughly 150k characters of marking
+// context; above that a single run becomes slow enough that splitting is safer.
+export const MAX_QUESTIONS_PER_RUN = 300;
+/** Papers above this size are marked, but the report says it took a long run. */
+export const LARGE_PAPER_QUESTIONS = 120;
 const BATCH_SIZE = 4;
 const DEFAULT_CONCURRENCY = 3;
 const MAX_LOCATE_CHUNKS = 6;
@@ -45,6 +51,13 @@ export type EvaluateOptions = {
   concurrency?: number;
   /** Set false to skip AI help for marks the parser could not find. */
   resolveMarks?: boolean;
+  /**
+   * Results from an earlier run. Used by the "retry unmarked answers" action:
+   * verified questions are reused and only the failed ones are sent again.
+   */
+  seed?: EvaluationReport;
+  /** Limit this run to these question keys (used together with `seed`). */
+  retryKeys?: string[];
 };
 
 function checkCancelled(signal?: AbortSignal) {
@@ -444,6 +457,18 @@ export async function evaluatePaper(options: EvaluateOptions): Promise<Evaluatio
   }
 
   const warnings: string[] = [];
+  const seedGrades = options.seed?.grades ?? [];
+  const retryKeys = options.retryKeys ? new Set(options.retryKeys) : null;
+  const questionsToMark = retryKeys ? questions.filter(question => retryKeys.has(question.key)) : questions;
+  if (!questionsToMark.length) {
+    throw new Error('There are no unfinished answers left to re-mark.');
+  }
+  if (questions.length > LARGE_PAPER_QUESTIONS) {
+    warnings.push(
+      `This is a large paper (${questions.length} questions), so marking runs in batches and may take several minutes. You can stop at any time and retry the unfinished answers.`
+    );
+  }
+
   progress('Matching your answers to the paper…');
   const segmentation = segmentAnswers(options.answerText, paper);
   warnings.push(...segmentation.warnings);
@@ -453,11 +478,11 @@ export async function evaluatePaper(options: EvaluateOptions): Promise<Evaluatio
     if (segment.text.trim()) answers.set(segment.key, segment.text);
   }
 
-  let missing = questions.filter(question => !answers.has(question.key));
+  let missing = questionsToMark.filter(question => !answers.has(question.key));
   const shouldLocate =
     missing.length > 0 &&
     options.answerText.trim().length > 60 &&
-    (segmentation.detectedRefs === 0 || missing.length >= Math.max(2, Math.ceil(questions.length * 0.4)));
+    (segmentation.detectedRefs === 0 || missing.length >= Math.max(2, Math.ceil(questionsToMark.length * 0.4)));
   if (shouldLocate) {
     const located = await locateUnlabelledAnswers({
       missing,
@@ -472,10 +497,10 @@ export async function evaluatePaper(options: EvaluateOptions): Promise<Evaluatio
         `${located.size} answer${located.size > 1 ? 's were' : ' was'} matched by content because the answer sheet did not label ${located.size > 1 ? 'them' : 'it'} clearly.`
       );
     }
-    missing = questions.filter(question => !answers.has(question.key));
+    missing = questionsToMark.filter(question => !answers.has(question.key));
   }
 
-  const items: GradingItem[] = questions
+  const items: GradingItem[] = questionsToMark
     .filter(question => answers.has(question.key))
     .map(question => ({ question, answer: (answers.get(question.key) ?? '').trim() }))
     .filter(item => item.answer.length > 0);
@@ -493,15 +518,22 @@ export async function evaluatePaper(options: EvaluateOptions): Promise<Evaluatio
   }
 
   let completed = 0;
+  // Large papers use a little less parallelism so a slow connection is not
+  // saturated by requests that each wait on the same provider.
+  const concurrency = options.concurrency ?? (items.length > 40 ? 2 : DEFAULT_CONCURRENCY);
   progress(items.length ? `Marking ${items.length} answers…` : 'No written answers were found.');
-  const graded = await mapLimit(batches, options.concurrency ?? DEFAULT_CONCURRENCY, async batch => {
+  const graded = await mapLimit(batches, concurrency, async batch => {
     const result = await gradeBatch(batch, context, chat, signal);
     completed += batch.length;
     progress(`Marked ${completed} of ${items.length} answers…`);
     return result;
   });
 
-  const grades: QuestionGrade[] = graded.flat();
+  const markedKeys = new Set(questionsToMark.map(question => question.key));
+  const grades: QuestionGrade[] = [
+    ...seedGrades.filter(grade => !markedKeys.has(grade.key)),
+    ...graded.flat(),
+  ];
   for (const question of missing) {
     const answeredElsewhere = answers.get(question.key);
     if (answeredElsewhere && answeredElsewhere.trim()) continue;
@@ -530,6 +562,37 @@ export async function evaluatePaper(options: EvaluateOptions): Promise<Evaluatio
   });
   validateReport(report);
   return report;
+}
+
+/**
+ * Re-mark only the answers that failed in a previous run, keeping the verified
+ * marks. This is what lets a long paper survive one provider hiccup without
+ * re-sending every answer (and without turning failures into zeros).
+ */
+export async function retryUnresolvedQuestions(input: {
+  report: EvaluationReport;
+  answerText: string;
+  board: string;
+  grade: string;
+  chat: ChatFn;
+  paperText?: string;
+  onProgress?: (message: string) => void;
+  signal?: AbortSignal;
+}): Promise<EvaluationReport> {
+  const keys = input.report.grades.filter(grade => grade.status === 'unresolved').map(grade => grade.key);
+  if (!keys.length) return input.report;
+  return evaluatePaper({
+    paper: input.report.paper,
+    answerText: input.answerText,
+    board: input.board,
+    grade: input.grade,
+    chat: input.chat,
+    paperText: input.paperText,
+    onProgress: input.onProgress,
+    signal: input.signal,
+    seed: input.report,
+    retryKeys: keys,
+  });
 }
 
 export function buildReport(input: {

@@ -100,8 +100,8 @@ describe('Puter provider', () => {
     });
     const result = await createPuterChat({ retries: 0 })(PROMPT);
     expect(result.text).toBe('fallback ok');
-    expect(result.model).toBe('deepseek/deepseek-v4-flash');
-    expect(seen).toEqual(['deepseek/deepseek-v4.1-flash', 'deepseek/deepseek-v4-flash']);
+    expect(result.model).toBe('openrouter:deepseek/deepseek-v4.1-flash');
+    expect(seen).toEqual(['deepseek/deepseek-v4.1-flash', 'openrouter:deepseek/deepseek-v4.1-flash']);
   });
 
   it('times out instead of waiting forever', async () => {

@@ -605,6 +605,55 @@ textarea::placeholder {
   font-size: 10px;
   font-weight: 700;
 }
+.model-notice button:disabled {
+  opacity: 0.6;
+}
+.model-notice.ai-check {
+  background: #f5f8f3;
+  border-color: #dde8da;
+  color: #3f6b4c;
+}
+.model-notice.ai-check p {
+  color: #6d7f6c;
+}
+.model-notice.ai-check.ok {
+  background: #eef7ef;
+  border-color: #cbe2d0;
+  color: #336a44;
+}
+.model-notice.ai-check.failed {
+  background: #fff0ed;
+  border-color: #f0cfc7;
+  color: #a34636;
+}
+.model-notice.ai-check.failed p {
+  color: #a8574a;
+}
+.model-notice .elapsed {
+  color: #9b8b64;
+}
+.retry-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 8px;
+}
+.privacy-note {
+  border: 1px solid #e6eae3;
+  background: #fbfcf9;
+  border-radius: 8px;
+  padding: 12px;
+  margin-top: 14px;
+}
+.privacy-note summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: #5d7561;
+}
+.privacy-note li {
+  color: #7d877b;
+}
 .setup-details {
   padding: 10px;
   margin-top: 6px;
