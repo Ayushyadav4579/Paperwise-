@@ -85,6 +85,24 @@ export function getPuter(): PuterGlobal | null {
   return window.puter ?? null;
 }
 
+/**
+ * The SDK is a plain CDN script. On a slow phone connection it can still be
+ * loading when marking starts, so wait for it briefly instead of reporting
+ * "AI service could not be loaded" on a connection that is merely slow.
+ */
+async function waitForPuter(timeoutMs = 4000): Promise<PuterGlobal | null> {
+  let puter = getPuter();
+  if (puter?.ai?.chat) return puter;
+  if (typeof document === 'undefined') return puter;
+  const started = Date.now();
+  while (Date.now() - started < timeoutMs) {
+    await new Promise(resolve => setTimeout(resolve, 120));
+    puter = getPuter();
+    if (puter?.ai?.chat) return puter;
+  }
+  return puter;
+}
+
 function contentToText(content: unknown): string {
   if (typeof content === 'string') return content;
   if (Array.isArray(content)) {
@@ -190,7 +208,7 @@ export function createPuterChat(config: { models?: string[]; retries?: number } 
   const retries = config.retries ?? REQUEST_RETRIES;
 
   return async (messages, options = {}) => {
-    const puter = getPuter();
+    const puter = await waitForPuter();
     if (!puter?.ai?.chat) {
       throw new AiError(
         'The AI service could not be loaded. Reload Paperwise with a working internet connection.',
