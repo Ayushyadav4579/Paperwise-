@@ -1,9 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import {
   assessTextQuality,
+  countQuestionLabels,
   joinPages,
   normaliseExtractedText,
   pageNumberFromMarker,
+  needsStructureRetry,
+  preferExtractedText,
   reconstructPageLines,
   stripPageMarkers,
   validateUpload,
@@ -41,6 +44,72 @@ describe('PDF text reconstruction', () => {
 
   it('returns an empty string for an empty page', () => {
     expect(reconstructPageLines([])).toBe('');
+  });
+
+  it('attaches a superscript to its line instead of making a separate line', () => {
+    const text = reconstructPageLines([
+      { str: '7. A body falls from 20 m. Take g = 9.8 m/s', transform: [1, 0, 0, 1, 50, 700], width: 200, height: 10 },
+      { str: '2', transform: [1, 0, 0, 1, 250, 704], width: 4, height: 6 },
+      { str: '. Find the time.', transform: [1, 0, 0, 1, 256, 700], width: 70, height: 10 },
+    ]);
+    expect(text.split('\n')).toEqual(['7. A body falls from 20 m. Take g = 9.8 m/s^2. Find the time.']);
+  });
+
+  it('preserves subscript geometry such as a chemical formula', () => {
+    const text = reconstructPageLines([
+      { str: 'Water is H', transform: [1, 0, 0, 1, 50, 700], width: 42, height: 10 },
+      { str: '2', transform: [1, 0, 0, 1, 92, 697], width: 4, height: 6 },
+      { str: 'O.', transform: [1, 0, 0, 1, 97, 700], width: 10, height: 10 },
+    ]);
+    expect(text).toBe('Water is H_2O.');
+  });
+
+  it('reads a two-column page one column at a time', () => {
+    const runs = [];
+    for (let index = 0; index < 12; index++) {
+      runs.push({ str: `Left column sentence number ${index + 1}.`, transform: [1, 0, 0, 1, 40, 700 - index * 20], width: 200, height: 10 });
+      runs.push({ str: `Right column sentence number ${index + 1}.`, transform: [1, 0, 0, 1, 340, 700 - index * 20], width: 200, height: 10 });
+    }
+    const lines = reconstructPageLines(runs).split('\n');
+    expect(lines).toHaveLength(24);
+    expect(lines[0]).toContain('Left column sentence number 1.');
+    expect(lines[11]).toContain('Left column sentence number 12.');
+    expect(lines[12]).toContain('Right column sentence number 1.');
+  });
+
+  it('keeps a table row together when the gaps are not a page gutter', () => {
+    const runs = [];
+    for (let index = 0; index < 5; index++) {
+      runs.push({ str: `${index + 1}`, transform: [1, 0, 0, 1, 40, 700 - index * 20], width: 5, height: 10 });
+      runs.push({ str: `${(index + 1) * 2}`, transform: [1, 0, 0, 1, 220, 700 - index * 20], width: 10, height: 10 });
+      runs.push({ str: `${(index + 1) * 3}`, transform: [1, 0, 0, 1, 400, 700 - index * 20], width: 10, height: 10 });
+    }
+    const lines = reconstructPageLines(runs).split('\n');
+    expect(lines[0]).toBe('1 2 3');
+    expect(lines[4]).toBe('5 10 15');
+  });
+});
+
+describe('structure comparison', () => {
+  it('counts printed question labels', () => {
+    expect(countQuestionLabels('1. One\n2. Two\nQ3. Three\npage 4')).toBe(3);
+    expect(countQuestionLabels('The value is 2.5 and x = 3.')).toBe(0);
+  });
+
+  it('requests a second OCR pass when a readable page has no question structure', () => {
+    const paperPage = 'Maximum Marks: 25\n' + 'The candidate must answer all questions. '.repeat(20);
+    expect(needsStructureRetry(paperPage)).toBe(true);
+    const answerPage = 'Photosynthesis converts light energy into chemical energy. '.repeat(20);
+    expect(needsStructureRetry(answerPage)).toBe(false);
+    expect(needsStructureRetry('1. One\n2. Two')).toBe(false);
+  });
+
+  it('prefers the extraction that finds more questions, even if shorter', () => {
+    const ocr = '1. Find x. 2\n2. Find y. 3\n3. Find z. 2';
+    const layer = 'Find x. Find y. Find z. Some extra watermark text.'.repeat(3);
+    expect(preferExtractedText(layer, ocr)).toBe(true);
+    expect(preferExtractedText(ocr, layer)).toBe(false);
+    expect(preferExtractedText(ocr, ocr + ' trailing')).toBe(true);
   });
 });
 

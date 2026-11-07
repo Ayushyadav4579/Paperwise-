@@ -380,7 +380,15 @@ function distributePartAnswers(
     const parent = byKey.get(key)?.parentKey ?? key;
     const parts = children.get(parent);
     if (!parts?.length || parts.length < 2) continue;
-    const split = splitPartAnswer(text, parts);
+    // When the sheet starts at `Q6. (a) ...`, answer segmentation files the
+    // text under Q6(a) and strips the first label. Re-add it so a following
+    // `(b)` can still be split into its own part.
+    let source = text;
+    if (key !== parent) {
+      const label = key.slice(parent.length).toLowerCase();
+      if (label && !new RegExp(`\(${label}\)`, 'i').test(text)) source = `(${label}) ${text}`;
+    }
+    const split = splitPartAnswer(source, parts);
     if (split) {
       for (const [partKey, partText] of split) {
         if (!answers.has(partKey)) answers.set(partKey, partText);

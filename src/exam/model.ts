@@ -39,7 +39,10 @@ export type PaperQuestion = {
   marksEvidence: string | null;
   section: string;
   kind: QuestionKind;
+  /** Page the question was printed on, when the upload reported pages. */
   page: number | null;
+  /** Line within that page, so a flagged question can be found again. */
+  pageLine?: number | null;
   /** Optional marking points supplied by the student/teacher. */
   markingPoints?: string;
 };

@@ -8,7 +8,10 @@ It is designed to fail safely: a mark is never invented, and a model reply that 
 
 1. **Extraction** (`src/fileText.ts`, `src/extraction/layout.ts`)
    - Text-based PDFs are rebuilt into real lines from glyph coordinates, so question numbering and paragraphs survive.
+   - Raised and lowered glyph runs are attached to their line and kept as `^` / `_` notation, so `m/s²` no longer becomes a stray `2` line that can look like a question number.
+   - A wide vertical gutter that runs down the page is treated as a column break, so two-column papers are read one column at a time; tables with short cells are not mistaken for columns.
    - Pages are marked (`--- Page N ---`) and scanned pages fall back to offline Tesseract OCR in English and Hindi.
+   - When a text layer and its OCR pass both exist, the result that finds more numbered questions wins, not merely the longer one.
    - A page whose first OCR pass is unusable is OCR'd again after adaptive local thresholding. On the faint-pencil test page this changed garbled output into every printed line.
    - iPhone HEIC/HEIF photos are converted to JPEG in the browser before OCR; a conversion failure is reported, never silently skipped.
    - Every page is quality-checked. Unreadable or partly readable pages are reported by page number.
@@ -16,6 +19,8 @@ It is designed to fail safely: a mark is never invented, and a model reply that 
 
 2. **Paper parsing** (`src/exam/paper.ts`)
    - Detects questions, sub-parts (`(a)`, `(i)`), sections, instructions and internal choices (`OR`).
+   - Distinguishes question labels from mathematical values: `2.5`, `20 m/s`, `x + 2, find ...`, equation numbers `(1)` and numbered calculation steps do not create questions. A question that starts with a quantity (`7. 2 kg ...`) is still recognised, including when a PDF merged it onto the previous question's line.
+   - Numeric table rows stay inside the question that introduces them.
    - Reads maxima only from printed evidence: a per-question mark, a section distribution (`3 × 2 = 6`), or an instruction such as "each question carries 2 marks".
    - If a maximum cannot be proven, the question is flagged and the student confirms it; nothing is guessed. As a second chance, the model may propose a maximum **only** when it quotes printed evidence that is verified verbatim against the paper.
 
@@ -45,7 +50,7 @@ The **Check AI connection** button in the app sends one tiny real request throug
 bun install
 bun run dev      # Vite preview
 bun tsc -b --noEmit
-bun test         # 112 unit/contract tests: parsing, matching, grading, validation, provider failures
+bun test         # 178 unit/contract tests: parsing, maths, matching, grading, validation, provider failures
 ```
 
 ### Real-document tests
@@ -54,10 +59,11 @@ bun test         # 112 unit/contract tests: parsing, matching, grading, validati
 
 ```bash
 PAPERWISE_REAL_DOCS=1 bunx vitest run tests/real-documents.test.ts
-bun run scripts/make-fixtures.ts   # rebuild the fixtures (needs the fonts in scripts/make-fixtures.ts)
+bun run scripts/make-fixtures.ts        # rebuild the general fixtures
+bun run scripts/make-math-fixtures.ts   # rebuild the mathematical PDF and scan
 ```
 
-It covers a digital PDF with a text layer, an image-only scanned PDF, a rotated/noisy photo, a handwritten-style ruled answer sheet, a Hindi page and a faint-pencil page with a table, equation and diagram. These are generated documents, not photographs of real student scripts.
+It covers a digital PDF with a text layer, an image-only scanned PDF, a rotated/noisy photo, a handwritten-style ruled answer sheet, a Hindi page, a scanned mathematical paper and a faint-pencil page with a table, equation and diagram. `tests/math-pdf.test.ts` additionally reads a two-page maths PDF whose exponents are real raised glyph runs, then marks it end to end. These are generated documents, not photographs of the user's original paper or of real student scripts.
 
 ## Privacy and data flow
 
@@ -88,7 +94,10 @@ First start downloads model weights. See `docs/API.md`. Do not expose an unauthe
 
 - Handwritten OCR is imperfect: tesseract confuses `l`, `i` and `t` in cursive handwriting, and faint pencil needs the second pass. Unreadable pages are reported instead of pretending they were read.
 - Diagrams are not interpreted visually. A question that only refers to a drawn diagram is judged on the text the student wrote.
-- Equations are read as plain text; complex notation and tables may lose structure even when the surrounding sentence is read correctly.
+- Equations are read as plain text. Inline fractions (`3/4`), powers, roots and units are preserved, and geometric superscripts/subscripts in a digital PDF become `^`/`_`; stacked fractions, matrices and large operators may still lose their two-dimensional layout.
+- OCR of mathematical symbols is imperfect: on the scanned maths fixture tesseract read `2^3` as `2/3` and lost one printed mark. The denominator warning keeps the paper total correct instead of silently marking out of the smaller number.
+- OCR digits are not guessed. `Q`/`O`/`0` and `1`/`l` are handled, but a `2` read as `3` cannot be recovered safely; the missing-mark and total warnings surface it for review.
+- The mathematical fixtures are synthetic reproductions of extraction structure. The user's original Physics paper is not in the repository; upload it to verify that exact paper.
 - Printed marks are inferred from the paper's text. Unusual layouts may need the student to confirm a maximum.
 - AI marking is an assistant, not a certified examiner. Scores should be reviewed against a teacher's marking scheme.
 - A run is capped at 300 questions and 120 pages per file; beyond that, split the paper. This is a run-time/provider budget, not a grading limitation.

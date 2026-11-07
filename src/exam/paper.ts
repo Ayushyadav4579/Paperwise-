@@ -36,9 +36,11 @@ const QUESTION_SPACED_RE = new RegExp(
   'i'
 );
 // A question number in the middle of an extracted line. OCR frequently reads
-// `Q` as `O` or `0` and `1` as `l`, so those prefixes and glyphs are accepted.
+// `Q` as `O` or `0`, so those prefixes are accepted. Inline labels are only
+// trusted with a `.` or `)` and a new sentence-like token: `x + 2, find ...` is
+// a mathematical value, not a question boundary.
 const INLINE_START_RE = new RegExp(
-  `(^|[\\s])(${QUESTION_LABEL}\\s*[.:]?\\s*)?(\\d{1,3}|[lI])\\s*([.):\\],;:\\-–—])(?!\\d)\\s*(?=[A-Za-z(\\u0900-\\u097F"“'])`,
+  `(^|[\\s])(${QUESTION_LABEL}\\s*[.:]?\\s*)?(\\d{1,3})\\s*([.)])(?!\\d)\\s*(?=[A-Z(\\[\\"'“”‘’√∛−\\u0900-\\u097F]|\\d+(?:\\.\\d+)?\\s+[A-Za-z(])`,
   'gi'
 );
 const MCQs = /\b(?:choose|select|tick|which\s+of\s+the\s+following|correct\s+option|multiple\s+choice)\b/i;
@@ -75,6 +77,8 @@ type Draft = {
   /** Marks rule that was active in this question's own section. */
   sectionMarks: MarksInfo | null;
   page: number | null;
+  /** Line number within the page, kept as the question's source location. */
+  pageLine: number | null;
   parts: Draft[];
 };
 
@@ -129,9 +133,27 @@ function inlineStarts(line: string): Array<{ number: number; index: number }> {
     if (match[0].length === 0) regex.lastIndex++;
     if (number === null) continue;
     const index = match.index + (match[1]?.length ?? 0);
+    // `x = 2. Find ...` is a value followed by a new sentence, not a question
+    // label. Only a boundary after a value, closing bracket or mark may start
+    // a question in the middle of a line.
+    const before = line.slice(0, index).trimEnd();
+    if (/[=+\-−×÷/*^<>(\[{,]\s*$/.test(before)) continue;
+    // A question may itself start with a quantity (`7. 2 kg of ice ...`). In a
+    // merged line that is only trusted when the previous token is a printed
+    // mark or value, never a bare word (`the value 7. 2 kg`).
+    const after = line.slice(match.index + match[0].length);
+    if (/^\d+(?:\.\d+)?\s+[A-Za-z(]/.test(after) && !/[\d)\]\.]\s*$/.test(before)) continue;
     found.push({ number, index });
   }
   return found;
+}
+
+/** A table/data row such as `2 4 6 8` must not start a question from its `2`. */
+function looksLikeDataRow(line: string): boolean {
+  const tokens = line.trim().split(/\s+/);
+  if (tokens.length < 4) return false;
+  const numeric = tokens.filter(token => /^[-+]?\d+(?:\.\d+)?$/.test(token)).length;
+  return numeric >= tokens.length - 1;
 }
 
 /**
@@ -212,7 +234,8 @@ function bareTrailingMarks(text: string, optionRow: boolean): MarksInfo | null {
   if (max === null || max > 20) return null;
   const before = text.slice(0, match.index).trimEnd();
   if (before.length < 8) return null;
-  if (!optionRow && !/[.?!:;)\]]$/.test(before)) return null;
+  // The danda (।) ends Hindi sentences, just like a full stop.
+  if (!optionRow && !/[.?!:;)\]।]$/.test(before)) return null;
   return { max, evidence: `“${before.slice(-32)} ${match[1]}”` };
 }
 
@@ -250,7 +273,21 @@ function marksFromText(lines: string[]): MarksInfo | null {
     const rowMark = bareTrailingMarks(full, true);
     if (rowMark) return rowMark;
   }
-  return bareTrailingMarks(text, false);
+  const combined = bareTrailingMarks(text, false);
+  if (combined) return combined;
+  // Calculation steps after the statement push the printed mark away from the
+  // end of the question, so a mark at the end of any of its own lines counts.
+  for (const line of stem) {
+    const strong = line.slice(-48).match(TRAILING_MARKS_RE) ?? lastMatch(line.slice(-80), WORD_MARKS_RE);
+    if (!strong) continue;
+    const max = clampMarks(Number(strong[1]));
+    if (max !== null) return { max, evidence: strong[0].trim() };
+  }
+  for (const line of stem) {
+    const bare = bareTrailingMarks(line, false);
+    if (bare) return bare;
+  }
+  return null;
 }
 
 function stripMarksMarker(text: string): string {
@@ -258,16 +295,23 @@ function stripMarksMarker(text: string): string {
     text
       .replace(TRAILING_MARKS_RE, '')
       .replace(TRAILING_DISTRIBUTION_RE, '')
-      .replace(/\s*[\[(]\s*\d{1,3}(?:\.\d+)?\s*(?:marks?|अंक|m|M)?\s*[\])]\s*$/gi, ' ')
+      .replace(/\s*[\[(]\s*\d{1,3}(?:\.\d+)?\s*(?:marks?|अंक|m|M)?\s*[\])]\s*$/gim, ' ')
       // A plain mark after sentence punctuation is not part of the question.
-      .replace(/([.?!:;)\]])\s+\d{1,2}(?:\.\d+)?\s*$/, '$1')
+      // The multiline flag also removes it when calculation steps follow.
+      .replace(/([.?!:;)\]।])\s+\d{1,2}(?:\.\d+)?[ \t]*$/gm, '$1')
   );
 }
 
-/** Remove a bare mark that was printed at the end of an option row. */
+/**
+ * Remove a bare mark printed at the end of an option row. Only the resolved
+ * mark itself is removed: a numeric table ending in `10` must stay in the
+ * question even when the mark is `3`.
+ */
 function stripBareOptionMark(text: string, marks: MarksInfo | null): string {
-  if (!marks || !/\d/.test(marks.evidence)) return text;
-  return cleanInline(text.replace(/\s+\d{1,2}(?:\.\d+)?\s*$/, ''));
+  if (!marks) return text;
+  const match = text.match(/\s+(\d{1,2}(?:\.\d+)?)\s*$/);
+  if (!match || match.index === undefined || Number(match[1]) !== marks.max) return text;
+  return cleanInline(text.slice(0, match.index));
 }
 
 /** Extract per-question marks printed once for a whole section header. */
@@ -313,7 +357,9 @@ function subpartLabel(line: string, usesRoman: boolean, existingParts: Draft[]):
 }
 
 function buildQuestionText(lines: string[]): string {
-  return stripMarksMarker(lines.join(' '));
+  // Strip per line: a mark printed after the statement is left behind when
+  // numbered calculation steps follow it, and joining first would hide it.
+  return cleanInline(lines.map(line => stripMarksMarker(line)).join(' '));
 }
 
 /**
@@ -351,6 +397,14 @@ export function parsePaper(rawText: string): Paper {
   let currentPart: Draft | null = null;
   let inChoice = false;
   let expected = 1;
+  // Highest question number seen in this section. A number that does not move
+  // forward is a numbered calculation step or an equation label, not a new
+  // question. Section numbering may restart, so this resets per section.
+  let sectionHighest = 0;
+  // When a numbered step is detected, its successors stay steps until a line
+  // with its own printed marks proves it is a real question.
+  let stepMode: number | null = null;
+  let pageLine = 0;
 
   const lines = toLines(rawText);
   const usesRoman = /\((?:ii|iii|iv|vi|vii|viii|ix)\)/i.test(rawText);
@@ -366,6 +420,7 @@ export function parsePaper(rawText: string): Paper {
       section: currentSection?.name ?? '',
       sectionMarks,
       page,
+      pageLine,
       parts: [],
       mcq: false,
     };
@@ -374,6 +429,8 @@ export function parsePaper(rawText: string): Paper {
     currentPart = null;
     inChoice = false;
     expected = number + 1;
+    sectionHighest = Math.max(sectionHighest, number);
+    stepMode = null;
     return draft;
   };
 
@@ -388,6 +445,7 @@ export function parsePaper(rawText: string): Paper {
       section: parent.section,
       sectionMarks: parent.sectionMarks,
       page,
+      pageLine,
       parts: [],
       mcq: false,
     };
@@ -421,29 +479,39 @@ export function parsePaper(rawText: string): Paper {
   const isMultipleChoice = (draft: Draft | null): boolean =>
     !!draft && (draft.mcq || MCQs.test(draft.lines.join(' ')));
 
-  const pending: string[] = [];
+  // Split-off pieces are already known to be question starts, so they must not
+  // be re-classified as numbered steps.
+  const pending: Array<{ text: string; forced: boolean }> = [];
   for (let index = 0; index < lines.length || pending.length; ) {
-    const rawLine = pending.length ? pending.shift()! : lines[index++];
+    const entry = pending.length ? pending.shift()! : { text: lines[index++], forced: false };
+    const rawLine = entry.text;
+    const forced = entry.forced;
     let trimmed = rawLine.trim();
     if (!trimmed) continue;
 
     const markerPage = pageNumberFromMarker(trimmed);
     if (markerPage !== null) {
       page = markerPage;
+      pageLine = 0;
       continue;
     }
+    pageLine += 1;
 
     // Break `... 1 2. The slope ...` into two questions before any other rule
     // sees it. Instructions are exempt because their numbered rules would
-    // otherwise be mistaken for question numbers.
+    // otherwise be mistaken for question numbers, and a numbered calculation
+    // step is left whole.
     if (!inInstructions) {
       const start = questionStart(trimmed);
-      const base = start ? start.number + 1 : expected;
-      const pieces = expandLine(trimmed, base);
-      if (pieces.length > 1) {
-        trimmed = pieces[0].trim();
-        if (!trimmed) continue;
-        pending.unshift(...pieces.slice(1));
+      const stepLikeStart = start !== null && !forced && currentTop !== null && start.number <= sectionHighest;
+      if (!stepLikeStart) {
+        const base = start && start.number > sectionHighest ? start.number + 1 : expected;
+        const pieces = expandLine(trimmed, base);
+        if (pieces.length > 1) {
+          trimmed = pieces[0].trim();
+          if (!trimmed) continue;
+          pending.unshift(...pieces.slice(1).map(text => ({ text, forced: true })));
+        }
       }
     }
 
@@ -461,7 +529,10 @@ export function parsePaper(rawText: string): Paper {
       currentSection = section;
       sectionMarks = marks;
       inInstructions = false;
-      // A new section always begins a new question group.
+      // A new section always begins a new question group. Numbering may also
+      // restart, so the ascending rule is scoped to the section.
+      sectionHighest = 0;
+      stepMode = null;
       currentTop = null;
       currentPart = null;
       inChoice = false;
@@ -495,6 +566,13 @@ export function parsePaper(rawText: string): Paper {
 
     if (PAGE_NUMBER_RE.test(trimmed)) continue;
 
+    // Table rows belong to the question that introduces them. Reading a cell
+    // such as `2` as a question label would split the table into fake questions.
+    if (currentTop && looksLikeDataRow(trimmed)) {
+      appendText(trimmed);
+      continue;
+    }
+
     const questionMatch = questionStart(trimmed);
     // An alternative printed under `OR` often repeats the question number:
     // `4. Define reflection ... OR 4. Define refraction ...`. It is the same
@@ -508,7 +586,31 @@ export function parsePaper(rawText: string): Paper {
       const { number, rest } = questionMatch;
       if (inChoice && currentTop && number !== currentTop.number) inChoice = false;
       const existing: Draft | undefined = tops.find(top => top.number === number);
-      if (existing && existing.lines.length === 0 && existing.parts.length === 0) {
+      const emptyExisting = !!existing && existing.lines.length === 0 && existing.parts.length === 0;
+      const atGroupStart = currentTop === null;
+      const stepLine = !forced && !atGroupStart && !emptyExisting && number <= sectionHighest;
+      // Once a numbered step is seen, its successors are steps too unless the
+      // line carries its own printed marks, which a calculation step never does.
+      // A question whose printed mark sits before its working has already
+      // ended; the numbered lines after it are steps. When no mark is printed
+      // on the question at all (a section-wide rule), the next number is a
+      // real question, not a step.
+      const currentHasPrintedMarks =
+        !!currentTop && !atGroupStart && marksFromText(currentTop.lines) !== null;
+      const continuesStep =
+        !forced &&
+        !atGroupStart &&
+        !emptyExisting &&
+        stepMode !== null &&
+        currentHasPrintedMarks &&
+        number === stepMode + 1 &&
+        marksFromText([trimmed]) === null;
+      if (stepLine || continuesStep) {
+        appendText(trimmed);
+        stepMode = number;
+        continue;
+      }
+      if (emptyExisting) {
         currentTop = existing;
         currentPart = null;
         inChoice = false;
@@ -657,6 +759,7 @@ export function parsePaper(rawText: string): Paper {
           section: draft.section,
           kind: detectQuestionKind({ text: `${built.text} ${text}`, choiceText: part.choiceText, max }),
           page: part.draft.page,
+          pageLine: part.draft.pageLine,
         });
       }
       continue;
@@ -698,6 +801,7 @@ export function parsePaper(rawText: string): Paper {
       section: draft.section,
       kind: detectQuestionKind({ text, choiceText: built.choiceText, max }),
       page: draft.page,
+      pageLine: draft.pageLine,
     });
   }
 
@@ -730,6 +834,14 @@ export function parsePaper(rawText: string): Paper {
         `Question number${missing.length > 1 ? 's' : ''} ${missing.join(', ')} ${missing.length > 1 ? 'are' : 'is'} missing between Q1 and Q${highest}. Paperwise did not invent them — check that the upload shows every question before marking.`
       );
     }
+  }
+
+  // Never silently present maths that the extractor could not encode.
+  const garbled = questions.filter(question => /\uFFFD|\?{2,}/.test(question.text)).map(question => question.ref);
+  if (garbled.length) {
+    warnings.push(
+      `The mathematical notation in ${garbled.slice(0, 6).join(', ')}${garbled.length > 6 ? '…' : ''} contains characters that could not be read. The extracted text was kept as it is — check that question against your paper before trusting the marks.`
+    );
   }
 
   const resolvedTotal = Math.round(questions.reduce((sum, question) => sum + (question.max ?? 0), 0) * 100) / 100;

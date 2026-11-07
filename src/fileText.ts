@@ -7,8 +7,11 @@ import {
   MAX_PDF_PAGES,
   MAX_TEXT_CHARS,
   assessTextQuality,
+  countQuestionLabels,
   joinPages,
+  needsStructureRetry,
   normaliseExtractedText,
+  preferExtractedText,
   reconstructPageLines,
   validateUpload,
   type PdfTextItemLike,
@@ -94,15 +97,22 @@ async function recognisePage(worker: OcrWorker, canvas: HTMLCanvasElement): Prom
   const first = normaliseExtractedText((await worker.recognize(canvas)).data.text || '');
   let best = first;
   let bestQuality = assessTextQuality(first);
-  if (!needsSecondPass(bestQuality, first.replace(/\s+/g, '').length)) return best;
+  // A clean-looking pass that finds no question structure is still incomplete.
+  if (!needsSecondPass(bestQuality, first.replace(/\s+/g, '').length) && !needsStructureRetry(first)) {
+    return best;
+  }
   let cleaned: HTMLCanvasElement | null = null;
   try {
     cleaned = binarisedCopy(canvas);
     const second = normaliseExtractedText((await worker.recognize(cleaned)).data.text || '');
     const secondQuality = assessTextQuality(second);
+    const secondLabels = countQuestionLabels(second);
+    const bestLabels = countQuestionLabels(best);
     const better =
-      qualityRank(secondQuality) > qualityRank(bestQuality) ||
-      (secondQuality === bestQuality && second.length > best.length * 1.1);
+      secondLabels > bestLabels ||
+      (secondLabels === bestLabels &&
+        (qualityRank(secondQuality) > qualityRank(bestQuality) ||
+          (secondQuality === bestQuality && second.length > best.length * 1.1)));
     if (second.trim() && better) {
       best = second;
       bestQuality = secondQuality;
@@ -237,12 +247,11 @@ async function extractPdf(
             const ocrText = await recognisePage(handle.worker, canvas);
             const ocrQuality = assessTextQuality(ocrText);
             if (ocrText && (ocrQuality !== 'poor' || quality === 'poor')) {
-              // Prefer OCR when it clearly reads more of the page.
-              if (ocrQuality !== 'poor' && ocrText.length >= text.trim().length) {
-                text = ocrText;
-                source = 'ocr';
-                quality = ocrQuality;
-              } else if (quality === 'poor') {
+              // Compare structure, not just length: OCR that finds more numbered
+              // questions is more useful even when its raw text is shorter.
+              const preferOcr =
+                ocrQuality !== 'poor' && (preferExtractedText(text, ocrText) || quality === 'poor');
+              if (preferOcr) {
                 text = ocrText;
                 source = 'ocr';
                 quality = ocrQuality;

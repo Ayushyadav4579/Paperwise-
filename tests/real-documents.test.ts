@@ -33,6 +33,8 @@ const needed = [
   'question-paper-hard.png',
   `${PHYSICS}/physics-paper-scan.pdf`,
   `${PHYSICS}/physics-paper-scan-page1.jpg`,
+  'tests/fixtures/math/math-paper-scan.pdf',
+  'tests/fixtures/math/math-paper-scan-page1.jpg',
 ];
 const available = needed.every(file => existsSync(file.startsWith('tests/') ? file : `${FIXTURES}/${file}`));
 const suite = RUN && available ? describe : describe.skip;
@@ -198,6 +200,26 @@ suite('real documents: OCR', () => {
     expect(paper.questions.length).toBeGreaterThanOrEqual(4);
     expect(paper.questions.some(question => question.ref === 'Q1')).toBe(true);
     expect(paper.questions.some(question => question.text.includes('vector quantity'))).toBe(true);
+  }, 180_000);
+
+  it('OCRs a scanned mathematical paper and keeps its equations in the questions', async () => {
+    // The scan is image-only; every character is OCR output. Its maths is
+    // rendered in plain ASCII (`2^3`, `m/s^2`), because tesseract cannot be
+    // trusted with stacked fractions or geometric exponents in a photo.
+    expect(await textLayerLength('tests/fixtures/math/math-paper-scan.pdf')).toBe(0);
+    const text = await ocr(await readFile('tests/fixtures/math/math-paper-scan-page1.jpg'), 'eng');
+    const paper = parsePaper(text);
+    record('math-paper-scan.pdf', text, paper.questions.length, `total ${paper.resolvedTotal} · ${paper.questions.map(q => q.ref).join(',')}`);
+    console.log('[math scan ocr]\n' + text.slice(0, 1400));
+    expect(text).toMatch(/Mathematics/i);
+    expect(paper.questions.length).toBeGreaterThanOrEqual(3);
+    expect(paper.questions.some(question => question.ref === 'Q1')).toBe(true);
+    expect(paper.questions.some(question => /2\^3|Evaluate/i.test(question.text))).toBe(true);
+    // Only page 1 was scanned, so 13 of the printed 25 marks are present. The
+    // paper total must stay 25 and say that marks are missing.
+    expect(paper.printedTotal).toBe(25);
+    expect(paper.resolvedTotal).toBeLessThan(25);
+    expect(paper.warnings.some(warning => /states a total of 25/.test(warning))).toBe(true);
   }, 180_000);
 
   it('recovers a faint page with the adaptive-threshold second pass', async () => {
